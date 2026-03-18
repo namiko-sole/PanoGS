@@ -1,0 +1,26 @@
+# Directory
+style_data
+preprocess/
+output_*/
+colmap_spliter/
+colmap_viewer/
+data_*/
+.vscode/
+__pycache__/
+dist
+build
+eggs
+parts
+sdist
+temp*
+
+# File
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dylib
+*.egg
+*.egg-info
+*.png
+*.bak
