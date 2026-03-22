@@ -427,7 +427,7 @@ class RenderPanel:
         with server.add_gui_folder("Camera Options"):
             fov_degrees = server.add_gui_slider(
                 "FOV",
-                initial_value=90,
+                initial_value=120,
                 min=1,
                 max=175,
                 step=1,

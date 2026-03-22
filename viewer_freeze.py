@@ -1250,86 +1250,6 @@ class Viewer:
                 self.gaussian_model.optimizer.zero_grad(set_to_none=True)
         
         def train_pano(styled_imgs, feat_dc, feat_rest, steps, random_flag=False):
-            def calculate_total_variation_loss(x, p=1):
-                batch_size = x.size(0)
-        
-                # 1. 计算垂直方向的梯度 (H 维度)
-                # 上下方向不相连（顶部是北极，底部是南极），所以使用普通的差值计算
-                diff_h = x[:, :, 1:, :] - x[:, :, :-1, :]
-                
-                # 2. 计算水平方向的梯度 (W 维度)
-                # 全景图左右相连，所以使用 torch.roll 进行循环移位计算差值
-                # shifts=-1 表示整个张量向左移动1格，最左侧的列会被移到最右侧
-                diff_w = torch.roll(x, shifts=-1, dims=-1) - x
-                
-                # 计算 Loss
-                if p == 1:
-                    # L1 范数（通常对保护边缘更有效）
-                    tv_h = torch.sum(torch.abs(diff_h))
-                    tv_w = torch.sum(torch.abs(diff_w))
-                elif p == 2:
-                    # L2 范数（平方）
-                    tv_h = torch.sum(torch.pow(diff_h, 2))
-                    tv_w = torch.sum(torch.pow(diff_w, 2))
-                else:
-                    raise ValueError("p must be 1 or 2")
-                    
-                # 平均到每个 batch (也可以根据需求平均到所有像素点)
-                tv_loss = (tv_h + tv_w) / batch_size
-                
-                return tv_loss
-            
-            def calculate_total_variation_loss_spherical(x, p=1, reduction='mean'):
-                B, C, H, W = x.shape
-                device = x.device
-                dtype = x.dtype
-
-                # ==========================================
-                # 1. 计算水平方向的 TV Loss (经度方向，带环形边界)
-                # ==========================================
-                # 极角 theta 范围 [0, pi]，对应图像的第 0 行到第 H-1 行
-                # 取像素中心的极角：(i + 0.5) * (pi / H)
-                theta_w = (torch.arange(H, dtype=dtype, device=device) + 0.5) * (math.pi / H)
-                # 计算权重 sin(theta) 并调整形状为 (1, 1, H, 1) 以便在 H 维度上广播
-                weight_w = torch.sin(theta_w).view(1, 1, H, 1)
-                
-                # 水平像素差值 (向左平移 1 像素，实现首尾相接)
-                diff_w = torch.roll(x, shifts=-1, dims=-1) - x
-                
-                # ==========================================
-                # 2. 计算垂直方向的 TV Loss (纬度方向)
-                # ==========================================
-                # 垂直方向计算的是第 i 行和第 i+1 行的差值
-                # 它们之间的交界线对应的极角为：(i + 1.0) * (pi / H)
-                theta_h = (torch.arange(H - 1, dtype=dtype, device=device) + 1.0) * (math.pi / H)
-                weight_h = torch.sin(theta_h).view(1, 1, H - 1, 1)
-                
-                # 垂直像素差值 (上下不相接)
-                diff_h = x[:, :, 1:, :] - x[:, :, :-1, :]
-
-                # ==========================================
-                # 3. 应用范数与权重
-                # ==========================================
-                if p == 1:
-                    loss_w = torch.abs(diff_w) * weight_w
-                    loss_h = torch.abs(diff_h) * weight_h
-                elif p == 2:
-                    loss_w = torch.pow(diff_w, 2) * weight_w
-                    loss_h = torch.pow(diff_h, 2) * weight_h
-                else:
-                    raise ValueError("Parameter 'p' must be 1 or 2.")
-
-                # ==========================================
-                # 4. 汇总与归一化
-                # ==========================================
-                total_loss = torch.sum(loss_w) + torch.sum(loss_h)
-
-                if reduction == 'mean':
-                    # 归一化：除以像素总数，使其对不同的分辨率 (如 1k, 2k, 4k) 具有可比性
-                    # 注意：这里我们除以 B*C*H*W，使得损失量级与普通 2D 图像的 mean TV Loss 类似
-                    total_loss = total_loss / (B * C * H * W)
-                    
-                return total_loss
             
             # equ_styled = E2P.Equirectangular(pano_styled)
             # train_steps = 1500 if steps==0 else self.train_steps.value
@@ -1369,11 +1289,11 @@ class Viewer:
                 #     random_img['camera_center'], random_img['styled_img_tensor'].to(self.device), random_img['raw_img_tensor'].to(self.device), random_img['pano_mask_tensor'].to(self.device)
                 camera_center, camera_rotation, equ_styled, equ_mask = \
                     random_img['camera_center'], random_img['camera_rotation'], random_img['styled_img_tensor'], random_img['pano_mask_tensor']
+                camera_point_mask = torch.from_numpy(random_img['camera_point_mask']).to(self.device).bool()
 
                 loss = 0
                 color_loss = 0
                 ssim_loss = 0
-                tv_loss = 0
                 propagate_loss = 0
                 project_loss = 0
                 for idx, params in enumerate(pers_params):
@@ -1414,7 +1334,6 @@ class Viewer:
                     color_loss += l1_loss(equ_mask[idx].to(self.device) * rendered.permute(2,0,1)[None], equ_mask[idx].to(self.device) * equ_styled[idx][None].to(self.device))
                     ssim_loss += 1.0 - ssim(equ_mask[idx].to(self.device) * rendered.permute(2,0,1)[None], equ_mask[idx].to(self.device) * equ_styled[idx][None].to(self.device))
                     # color_loss += torch.nn.functional.l1_loss(rendered.permute(2,0,1)[None], equ_styled[idx][None])
-                    tv_loss += calculate_total_variation_loss_spherical(rendered.permute(2,0,1)[None])
                     
                     torch.cuda.empty_cache()
                     # perceptual_loss = perceptual(rendered.permute(2,0,1)[None], raw_image.permute(2,0,1)[None])
@@ -1433,14 +1352,14 @@ class Viewer:
                 propagate_loss = l1_loss(self.gaussian_model._features_dc[~all_point_mask], mean_feat_dc) + \
                                 l1_loss(self.gaussian_model._features_rest[~all_point_mask], mean_feat_rest)
 
-                loss = 0.8*color_loss/6 + 0.2*ssim_loss/6 + 1*propagate_loss + 1*project_loss + 1e-3*tv_loss/6
+                image_project_loss = 0.8 * color_loss + 0.2 * ssim_loss + 1 * project_loss
+                loss = image_project_loss + 1 * propagate_loss
                 # loss = 1*color_loss + 1*propagate_loss + 10*project_loss
 
                 if step%20==0:
                     print("total_loss:", loss.data,
                           "\t color_loss:", color_loss.data,
                           "\t ssim_loss:", ssim_loss.data,
-                          "\t tv_loss:", tv_loss.data,
                           "\t propagate_loss:", propagate_loss.data,
                           "\t project_loss:", project_loss.data,
                         #   "\t sobel_loss:", sobel_loss.data,
@@ -1448,7 +1367,17 @@ class Viewer:
                           )
                     self.update_client()
                 torch.cuda.empty_cache()
-                loss.backward(retain_graph=True)
+
+                # Backward pass 1: image/project losses are camera-local.
+                image_project_loss.backward()
+                with torch.no_grad():
+                    if self.gaussian_model._features_dc.grad is not None:
+                        self.gaussian_model._features_dc.grad[~camera_point_mask] = 0
+                    if self.gaussian_model._features_rest.grad is not None:
+                        self.gaussian_model._features_rest.grad[~camera_point_mask] = 0
+
+                # Backward pass 2: propagation loss updates non-current-view points.
+                propagate_loss.backward()
                 self.gaussian_model.optimizer.step()
                 self.gaussian_model.optimizer.zero_grad(set_to_none=True)
 
@@ -1681,6 +1610,7 @@ class Viewer:
                 'point_mask': cur_point_mask,
                 'all_point_mask': all_point_mask,
                 'cam_mask': cam_mask,
+                'camera_point_mask': all_point_mask.copy(),
                 # 'feat_dc_visible': torch.nn.Parameter(feat_dc_visible.contiguous()),
                 # 'feat_rest_visible': torch.nn.Parameter(feat_rest_visible.contiguous()),
                 # 'styled_img': equ_styled_img,
@@ -1697,10 +1627,13 @@ class Viewer:
             # Load precomputed distance-based pano masks for current stage.
             for sidx in range(len(styled_imgs)):
                 every_cam_id = styled_imgs[sidx]['cam_id']
-                stage_mask_path = os.path.join(save_dir, f"cam_{idx}", "mask", f"cam_{every_cam_id}", "pano_mask.png")
+                stage_mask_path = os.path.join(save_dir, f"cam_{idx}", "mask", f"cam_{every_cam_id}", "pano_img.png")
                 if os.path.exists(stage_mask_path):
                     stage_mask = cv2.imread(stage_mask_path)
                     styled_imgs[sidx]['pano_mask_tensor'] = get_pano_imgs_tensor(E2P.Equirectangular(stage_mask))
+                stage_point_mask_path = os.path.join(save_dir, f"cam_{idx}", "mask", f"cam_{every_cam_id}", "point_mask.npy")
+                if os.path.exists(stage_point_mask_path):
+                    styled_imgs[sidx]['camera_point_mask'] = np.load(stage_point_mask_path).astype(np.bool_)
 
             print(f"After save: {self.get_gpu_memory_usage()}")
             torch.cuda.empty_cache()

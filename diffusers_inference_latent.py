@@ -304,7 +304,7 @@ def generate_image(prompt, style_img_path, input_img_path, ref_img_path, depth_i
                             image=input_img,
                             mask_image=input_img_mask,
                             control_image=[depth_map, canny_map],
-                            controlnet_conditioning_scale=[0.0, 1.0],
+                            controlnet_conditioning_scale=[0.0, 0.8],
                             output_type="latent",
                         ).images
 
@@ -341,22 +341,22 @@ def generate_image(prompt, style_img_path, input_img_path, ref_img_path, depth_i
     return images[0]
 
 if __name__ == "__main__":
-    input = "preprocess/manual_d918a_cnn_room3_adaptive_mini/cam_23/styled/pano_img.png"
-    style = "style_data/indoor/room3.jpg"
-    ref = "preprocess/manual_d918a_cnn_room3_adaptive_mini/cam_23/pano_img.png"
+    input = "preprocess/truck_cartoon_focus_colmap_cnn_refine_plus/cam_162/styled/pano_img.png"
+    style = "style_data/outdoor/red_truck_cartoon.png"
+    ref = "preprocess/truck_cartoon_focus_colmap_cnn_refine_plus/cam_162/pano_img.png"
 
-    # image = generate_adain(content_path=input,
-    #                style_path=style,
-    #                save_path="temp.png")
+    image = generate_adain(content_path=input,
+                   style_path=style,
+                   save_path="temp.png")
     
-    image,mid = generate_image(prompt="",
+    image,mid = generate_image(prompt="red truck, cartoon style, red carriage, red trunk, red wood",
                             style_img_path=style,
                             input_img_path=input,
                             # input_img_path=input,
-                            mask_img_path="preprocess/manual_d918a_cnn_room3_adaptive_mini/cam_23/pano_mask.png",
+                            mask_img_path="preprocess/truck_cartoon_focus_colmap_cnn_refine_plus/cam_162/pano_mask.png",
                             ref_img_path=ref,
                             depth_img_path=ref,
-                            strength=0.9,
+                            strength=0.3,
                             )
     image.save("temp1.png")
     # mid.save("temp2.png")

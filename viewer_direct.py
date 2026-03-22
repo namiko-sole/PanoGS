@@ -66,6 +66,42 @@ from internal.utils.adain_utils.adain_api import generate_adain
 
 DROPDOWN_USE_DIRECT_APPEARANCE_EMBEDDING_VALUE = "@Direct"
 
+from skimage import exposure
+def apply_color_correction(
+    target, 
+    reference
+) -> Image.Image:
+    """
+    将 target 的颜色分布匹配到 reference。
+    支持输入文件路径 (str/Path) 或 PIL.Image 对象。
+    """
+    
+    # 1. 自动解析 target
+    if isinstance(target, (str, Path)):
+        target_img = Image.open(target).convert("RGB")
+    elif isinstance(target, Image.Image):
+        target_img = target.convert("RGB")
+    else:
+        raise TypeError("target 必须是文件路径(str/Path)或 PIL.Image 对象")
+
+    # 2. 自动解析 reference
+    if isinstance(reference, (str, Path)):
+        reference_img = Image.open(reference).convert("RGB")
+    elif isinstance(reference, Image.Image):
+        reference_img = reference.convert("RGB")
+    else:
+        raise TypeError("reference 必须是文件路径(str/Path)或 PIL.Image 对象")
+    
+    # 3. 转换为 Numpy 数组
+    target_arr = np.array(target_img)
+    reference_arr = np.array(reference_img)
+    
+    # 4. 进行直方图匹配 (channel_axis=-1 确保对齐 RGB 三个通道)
+    matched_arr = exposure.match_histograms(target_arr, reference_arr, channel_axis=-1)
+    
+    # 5. 转回 PIL 图像并返回
+    return Image.fromarray(matched_arr.astype(np.uint8))
+
 class Viewer:
     def __init__(
             self,
@@ -1409,6 +1445,7 @@ class Viewer:
                                                 strength=1.0,
                                                 )
                     styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
+                    styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined_corrected.png'))
                 else:
                     ### Diffusers I2I LowStrength ###
                     # styled_img = generate_image(prompt=self.prompt_text.value,
@@ -1447,8 +1484,30 @@ class Viewer:
                                                 depth_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
                                                 strength=0.3,
                                                 )
+                    styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined_before.png'))
+                    inpainted_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_inpainted_before.png'))
+
+                    corrected_styled_img = apply_color_correction(target=styled_img, reference=os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_img.png'))
+                    corrected_inpainted_img = apply_color_correction(target=inpainted_img, reference=os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_img.png'))
+                    corrected_styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined_before_corrected.png'))
+                    corrected_inpainted_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_inpainted_before_corrected.png'))
+
+                    styled_img, inpainted_img = generate_image(prompt=self.prompt_text.value,
+                                                style_img_path=self.style_img,
+                                                input_img_path=os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined_before_corrected.png'),
+                                                mask_img_path=os.path.join(save_dir, f'cam_{idx}', 'mask', f'cam_{idx}', 'pano_mask.png'),
+                                                ref_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
+                                                depth_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
+                                                strength=0.3,
+                                                mask_reverse=False
+                                                )
                     styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
                     inpainted_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_inpainted.png'))
+
+                    corrected_styled_img = apply_color_correction(target=styled_img, reference=os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_img.png'))
+                    corrected_inpainted_img = apply_color_correction(target=inpainted_img, reference=os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_img.png'))
+                    corrected_styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined_corrected.png'))
+                    corrected_inpainted_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_inpainted_corrected.png'))
 
                     ### SDWebUI API ###
                     # styled_img = inpaint(input_path=os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_img.png'),
@@ -1466,7 +1525,7 @@ class Viewer:
                     #                             strength=0.3)
                     # refine_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
 
-                styled_img = cv2.imread(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
+                styled_img = cv2.imread(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined_corrected.png'))
             raw_img = cv2.imread(os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'))
             # styled_img = cv2.imread(os.path.join(save_dir, f'cam_{idx}', 'pano_styled.png'))
 

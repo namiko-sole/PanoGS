@@ -2,7 +2,6 @@
 style_data
 preprocess/
 output_*/
-colmap_spliter/
 colmap_viewer/
 data_*/
 .vscode/
@@ -24,3 +23,5 @@ temp*
 *.egg-info
 *.png
 *.bak
+*.pth
+*.ckpt
