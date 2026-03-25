@@ -76,14 +76,16 @@ class ClientThread(threading.Thread):
         if ptc_mode:
             return image_width, image_height
     
-        fx = torch.tensor([fov2focal(cam.fov, max_res)], dtype=torch.float)
+        # `cam.fov` is tied to the client camera; use the final render size to keep intrinsics consistent.
+        fy_value = fov2focal(cam.fov, image_height)
+        fx_value = fy_value
         R, T = self.get_RT(self.client.camera.wxyz, self.client.camera.position)
 
         return Cameras(
             R=R.unsqueeze(0),
             T=T.unsqueeze(0),
-            fx=fx,
-            fy=fx,
+            fx=torch.tensor([fx_value], dtype=torch.float),
+            fy=torch.tensor([fy_value], dtype=torch.float),
             cx=torch.tensor([(image_width // 2)], dtype=torch.int),
             cy=torch.tensor([(image_height // 2)], dtype=torch.int),
             width=torch.tensor([image_width], dtype=torch.int),
@@ -141,9 +143,11 @@ class ClientThread(threading.Thread):
             image_width = max_res
             image_height = int(image_width / self.last_camera.aspect)
 
+        fy_value = fov2focal(self.last_camera.fov, image_height)
+        fx_value = fy_value
         camera_params = {
-            'fx': torch.tensor([fov2focal(self.last_camera.fov, max_res)], dtype=torch.float),
-            'fy': torch.tensor([fov2focal(self.last_camera.fov, max_res)], dtype=torch.float), 
+            'fx': torch.tensor([fx_value], dtype=torch.float),
+            'fy': torch.tensor([fy_value], dtype=torch.float), 
             'cx': torch.tensor([(image_width // 2)], dtype=torch.int),
             'cy': torch.tensor([(image_height // 2)], dtype=torch.int),
             'width': torch.tensor([image_width], dtype=torch.int),

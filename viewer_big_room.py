@@ -18,7 +18,7 @@ sys.path.append(os.path.join(current_dir, '2d_gaussian_splatting'))
 
 from pathlib import Path
 from argparse import ArgumentParser
-from typing import Tuple, Literal, List
+from typing import Tuple, Literal, List, Dict, Set, Optional
 from viser.theme import TitlebarButton, TitlebarConfig, TitlebarImage
 
 from arguments import ModelParams, PipelineParams, get_combined_args
@@ -65,6 +65,23 @@ import torchvision.transforms as transforms
 from internal.utils.adain_utils.adain_api import generate_adain
 
 DROPDOWN_USE_DIRECT_APPEARANCE_EMBEDDING_VALUE = "@Direct"
+
+ROOM_PALETTE = [
+    (231, 76, 60),
+    (52, 152, 219),
+    (46, 204, 113),
+    (241, 196, 15),
+    (155, 89, 182),
+    (230, 126, 34),
+    (26, 188, 156),
+    (149, 165, 166),
+    (192, 57, 43),
+    (41, 128, 185),
+    (39, 174, 96),
+    (243, 156, 18),
+]
+UNASSIGNED_COLOR = (170, 170, 170)
+SELECTED_COLOR = (255, 255, 0)
 
 class Viewer:
     def __init__(
@@ -133,6 +150,20 @@ class Viewer:
         self.style_img = style_img
         self.prep_dir = prep_dir
 
+        self.manual_split_selected_ids: Set[int] = set()
+        self.manual_split_assignments: Dict[int, int] = {}
+        self.manual_split_last_assignments: Optional[Dict[int, int]] = None
+        self.manual_split_room_point_masks: Dict[int, np.ndarray] = {}
+        self.manual_split_point_room_ids: Optional[np.ndarray] = None
+        self.camera_handles_by_idx: Dict[int, viser.CameraFrustumHandle] = {}
+        self.camera_handle_names: Dict[int, str] = {}
+        self.manual_split_rect_select_clients: Set[int] = set()
+        self.json_camera_poses: List[dict] = []
+        self.colmap_camera_poses: List[dict] = []
+        self.camera_pose_source_active: str = "colmap"
+        self.manual_split_color_backup_dc: Optional[torch.Tensor] = None
+        self.manual_split_color_backup_rest: Optional[torch.Tensor] = None
+
         # init model & scene 
         self._init_models(iterations)
         self._init_scene_camera_transform(self.cameras_json, reorient, up)
@@ -176,36 +207,55 @@ class Viewer:
 
         self.camera_transform = transform
 
-    def _init_camera_poses(self, cameras_json_path):
-        if not os.path.exists(cameras_json_path):
-            return []
-        with open(cameras_json_path, "r") as f:
-            camera_poses = json.load(f)
-        if camera_poses:
-            self.camera_center = np.mean(np.asarray([i["position"] for i in camera_poses]), axis=0)
-        self.camera_poses = camera_poses
+    def _build_colmap_fallback_camera_poses(self) -> List[dict]:
+        camera_poses: List[dict] = []
+        for idx, cam in enumerate(self.colmap_cameras):
+            r_wc = np.asarray(cam.R, dtype=np.float32)
+            t = np.asarray(cam.T, dtype=np.float32)
+            cam_center = (-r_wc @ t).astype(np.float32)
+            width = int(getattr(cam, "width", 1024))
+            height = int(getattr(cam, "height", 1024))
+            fx = float(fov2focal(float(cam.FovX), width)) if hasattr(cam, "FovX") else float(max(width, 1))
+            camera_poses.append({
+                "img_name": str(getattr(cam, "image_name", f"cam_{idx:04d}.png")),
+                "rotation": r_wc.tolist(),
+                "position": cam_center.tolist(),
+                "width": width,
+                "height": height,
+                "fx": fx,
+                "pose_source": "colmap_fallback",
+            })
+        return camera_poses
 
-        # class GroupParams:
-        #     def __init__(self):
-        #         self.sh_degree = 0 #1 #3
-        #         self.source_path = ""
-        #         self.model_path = ""
-        #         self.path_style = ""
-        #         self.images = "images"
-        #         self.resolution = -1
-        #         self.forward_facing = False
-        #         self.white_background = False
-        #         self.data_device = "cuda"
-        #         self.eval = False
-        #         self.starting_iter = ""
-        # gargs = GroupParams()
-        # for arg in vars(self.args).items():
-        #     setattr(gargs, arg[0], arg[1])
-        # self.scene = Scene(gargs, self.gaussian_model)
-        # self.colmap_cameras = scene.getTrainCameras()
+    def _set_active_camera_pose_source(self, source: str) -> str:
+        if source == "json" and len(self.json_camera_poses) > 0:
+            self.camera_poses = list(self.json_camera_poses)
+            self.camera_pose_source_active = "json"
+        else:
+            self.camera_poses = list(self.colmap_camera_poses)
+            self.camera_pose_source_active = "colmap"
+
+        if len(self.camera_poses) > 0:
+            self.camera_center = np.mean(np.asarray([i["position"] for i in self.camera_poses]), axis=0)
+        return self.camera_pose_source_active
+
+    def _init_camera_poses(self, cameras_json_path):
         col_scene = sceneLoadTypeCallbacks["Colmap"](self.source_path, None, False)
         self.scene = col_scene
         self.colmap_cameras = col_scene.train_cameras
+
+        self.colmap_camera_poses = self._build_colmap_fallback_camera_poses()
+        self.json_camera_poses = []
+
+        if os.path.exists(cameras_json_path):
+            with open(cameras_json_path, "r") as f:
+                self.json_camera_poses = json.load(f)
+            print(f"[INFO] load camera poses from {cameras_json_path}, count={len(self.json_camera_poses)}")
+        else:
+            print(f"[WARN] camera json not found: {cameras_json_path}, fallback to COLMAP train cameras")
+
+        initial_source = "json" if len(self.json_camera_poses) > 0 else "colmap"
+        self._set_active_camera_pose_source(initial_source)
 
     def _get_training_gaussians(self, new_gaussians):
         # slow and large gpu consumption
@@ -221,22 +271,383 @@ class Viewer:
         total_memory = torch.cuda.memory_allocated() + torch.cuda.memory_reserved() 
         return f"{total_memory / 1024 ** 2:.1f} / {self.total_device_memory:.1f} MB"
 
-    def add_cameras_to_scene(self, viser_server):
-        if len(self.camera_poses) == 0:
+    @staticmethod
+    def _room_color(room_id: int) -> Tuple[int, int, int]:
+        return ROOM_PALETTE[room_id % len(ROOM_PALETTE)]
+
+    def _manual_split_status_text(self) -> str:
+        room_counts: Dict[int, int] = {}
+        for room_id in self.manual_split_assignments.values():
+            room_counts[room_id] = room_counts.get(room_id, 0) + 1
+        if len(room_counts) == 0:
+            room_msg = "none"
+        else:
+            room_msg = ", ".join([f"room_{rid}:{room_counts[rid]}" for rid in sorted(room_counts.keys())])
+        return (
+            f"Selected: {len(self.manual_split_selected_ids)} | Assigned: {len(self.manual_split_assignments)} / {len(self.camera_poses)} | "
+            f"Rooms: {room_msg}"
+        )
+
+    def _refresh_manual_split_camera_colors(self):
+        if not hasattr(self, "manual_split_enable"):
             return
 
-        self.camera_handles = []
+        for idx, handle in self.camera_handles_by_idx.items():
+            if idx in self.manual_split_selected_ids:
+                handle.color = SELECTED_COLOR
+                continue
+            room_id = self.manual_split_assignments.get(idx)
+            if room_id is None:
+                handle.color = UNASSIGNED_COLOR if self.manual_split_enable.value else (255, 255, 0)
+            else:
+                handle.color = self._room_color(room_id)
+
+    @staticmethod
+    def _project_world_to_screen01(
+        point_world: np.ndarray,
+        cam_wxyz: np.ndarray,
+        cam_pos: np.ndarray,
+        cam_fov: float,
+        cam_aspect: float,
+    ) -> Optional[np.ndarray]:
+        t_camera_world = vtf.SE3.from_rotation_and_translation(
+            vtf.SO3(cam_wxyz), cam_pos
+        ).inverse()
+        p_cam_h = t_camera_world.as_matrix() @ np.array([
+            float(point_world[0]),
+            float(point_world[1]),
+            float(point_world[2]),
+            1.0,
+        ])
+        p_cam = p_cam_h[:3]
+
+        z = float(p_cam[2])
+        if z <= 1e-6:
+            return None
+
+        tan_half = math.tan(float(cam_fov) * 0.5)
+        if tan_half <= 1e-8:
+            return None
+
+        xy = p_cam[:2] / z
+        xy /= tan_half
+        xy[0] /= float(cam_aspect)
+        xy01 = (1.0 + xy) * 0.5
+        return np.array([xy01[0], xy01[1], z], dtype=np.float64)
+
+    def _apply_manual_split_rect_select(
+        self,
+        client: viser.ClientHandle,
+        screen_pos: Tuple[Tuple[float, float], Tuple[float, float]],
+        mode: str,
+    ) -> int:
+        if len(self.camera_poses) == 0:
+            return 0
+
+        (x0, y0), (x1, y1) = screen_pos
+        x_min, x_max = float(min(x0, x1)), float(max(x0, x1))
+        y_min, y_max = float(min(y0, y1)), float(max(y0, y1))
+
+        cam = client.camera
+        cam_pos = np.asarray(cam.position, dtype=np.float64)
+        cam_wxyz = np.asarray(cam.wxyz, dtype=np.float64)
+        cam_fov = float(cam.fov)
+        cam_aspect = float(cam.aspect)
+
+        hits: Set[int] = set()
         camera_pose_transform = np.linalg.inv(self.camera_transform.cpu().numpy())
-        for camera in self.camera_poses:
-            name = camera["img_name"]
+        for idx, camera in enumerate(self.camera_poses):
             c2w = np.eye(4)
             c2w[:3, :3] = np.asarray(camera["rotation"])
             c2w[:3, 3] = np.asarray(camera["position"])
             c2w[:3, 1:3] *= -1
             c2w = np.matmul(camera_pose_transform, c2w)
+            center = c2w[:3, 3]
 
-            R = vtf.SO3.from_matrix(c2w[:3, :3])
-            R = R @ vtf.SO3.from_x_radians(np.pi)
+            proj = self._project_world_to_screen01(
+                point_world=center,
+                cam_wxyz=cam_wxyz,
+                cam_pos=cam_pos,
+                cam_fov=cam_fov,
+                cam_aspect=cam_aspect,
+            )
+            if proj is None:
+                continue
+            if x_min <= proj[0] <= x_max and y_min <= proj[1] <= y_max:
+                hits.add(idx)
+
+        if mode == "replace":
+            self.manual_split_selected_ids = hits
+        else:
+            self.manual_split_selected_ids |= hits
+
+        self._refresh_manual_split_camera_colors()
+        return len(hits)
+
+    def _bind_rect_select_for_client(self, client: viser.ClientHandle):
+        if client.client_id in self.manual_split_rect_select_clients:
+            return
+
+        @client.scene.on_pointer_event(event_type="rect-select")
+        def _rect_select(event: viser.ScenePointerEvent) -> None:
+            if not self.manual_split_enable.value:
+                return
+            if not self.manual_split_drag_select_enabled.value:
+                return
+            if len(event.screen_pos) < 2:
+                return
+
+            hit_count = self._apply_manual_split_rect_select(
+                client=event.client,
+                screen_pos=(event.screen_pos[0], event.screen_pos[1]),
+                mode=self.manual_split_select_mode.value,
+            )
+            self.manual_split_status.value = self._manual_split_status_text()
+            print(f"[INFO] drag-select hit cameras: {hit_count}")
+
+        self.manual_split_rect_select_clients.add(client.client_id)
+
+    def _update_rect_select_bindings(self, server: viser.ViserServer):
+        enable_rect_select = bool(self.manual_split_enable.value and self.manual_split_drag_select_enabled.value)
+        for client in server.get_clients().values():
+            if enable_rect_select:
+                self._bind_rect_select_for_client(client)
+            else:
+                if client.client_id in self.manual_split_rect_select_clients:
+                    client.scene.remove_pointer_callback()
+                    self.manual_split_rect_select_clients.remove(client.client_id)
+
+    def _compute_visibility_mask_spherical_zbuffer(
+        self,
+        point_xyz: torch.Tensor,
+        camera_center: np.ndarray,
+        width: int = 512,
+        height: int = 256,
+        depth_eps: float = 1e-3,
+    ) -> np.ndarray:
+        center = torch.tensor(camera_center, dtype=point_xyz.dtype, device=point_xyz.device)
+        rel = point_xyz - center[None, :]
+        dist = torch.linalg.norm(rel, dim=1)
+        valid = dist > 1e-8
+
+        # Orientation-free spherical projection for fast per-viewpoint visibility.
+        azimuth = torch.atan2(rel[:, 1], rel[:, 0])
+        elev = torch.asin(torch.clamp(rel[:, 2] / torch.clamp(dist, min=1e-8), min=-1.0, max=1.0))
+
+        u = ((azimuth + torch.pi) / (2.0 * torch.pi) * (width - 1)).long().clamp(0, width - 1)
+        v = ((elev + torch.pi * 0.5) / torch.pi * (height - 1)).long().clamp(0, height - 1)
+        linear_idx = v * width + u
+
+        zbuf = torch.full((height * width,), float("inf"), dtype=dist.dtype, device=dist.device)
+        valid_idx = linear_idx[valid]
+        valid_dist = dist[valid]
+        zbuf.scatter_reduce_(0, valid_idx, valid_dist, reduce="amin", include_self=True)
+
+        min_depth = zbuf[linear_idx]
+        visible = valid & (dist <= (min_depth + depth_eps))
+        return visible.detach().cpu().numpy().astype(np.bool_)
+
+    def _compute_point_room_assignments(self, assigned_camera_ids: List[int]) -> np.ndarray:
+        if len(assigned_camera_ids) == 0:
+            return np.full(self.gaussian_model.get_xyz.shape[0], -1, dtype=np.int32)
+
+        split_dir = os.path.join(self.prep_dir, "split") if self.prep_dir else None
+        visibility_dir = os.path.join(split_dir, "visibility") if split_dir is not None else None
+        if visibility_dir is not None:
+            os.makedirs(visibility_dir, exist_ok=True)
+
+        point_xyz = self.gaussian_model.get_xyz.detach()
+        cam_centers = []
+        visibility_masks = []
+        visibility_start = time.time()
+        for cam_idx in assigned_camera_ids:
+            center = np.array(self.camera_poses[cam_idx]["position"], dtype=np.float32)
+            cam_centers.append(center)
+
+            vis_mask = None
+            if visibility_dir is not None:
+                vis_path = os.path.join(visibility_dir, f"cam_{cam_idx}_point_visible.npy")
+                if os.path.exists(vis_path):
+                    vis_mask = np.load(vis_path).astype(np.bool_)
+
+            if vis_mask is None:
+                vis_mask = self._compute_visibility_mask_spherical_zbuffer(
+                    point_xyz=point_xyz,
+                    camera_center=center,
+                )
+                if visibility_dir is not None:
+                    np.save(vis_path, vis_mask.astype(np.uint8))
+
+            visibility_masks.append(vis_mask)
+        print(
+            f"[INFO] visibility by spherical z-buffer done: "
+            f"cams={len(assigned_camera_ids)}, points={point_xyz.shape[0]}, "
+            f"time={time.time() - visibility_start:.3f}s"
+        )
+
+        cam_centers_t = torch.tensor(
+            np.stack(cam_centers, axis=0),
+            dtype=point_xyz.dtype,
+            device=point_xyz.device,
+        )
+        dist_to_camera = torch.cdist(point_xyz, cam_centers_t)
+        nearest_any_idx = torch.argmin(dist_to_camera, dim=1)
+
+        visible_mat = torch.from_numpy(np.stack(visibility_masks, axis=1)).to(point_xyz.device)
+        inf_dist = torch.full_like(dist_to_camera, float("inf"))
+        visible_dist = torch.where(visible_mat, dist_to_camera, inf_dist)
+        nearest_visible_idx = torch.argmin(visible_dist, dim=1)
+        has_visible_camera = torch.isfinite(torch.min(visible_dist, dim=1).values)
+        chosen_cam_local_idx = torch.where(has_visible_camera, nearest_visible_idx, nearest_any_idx)
+
+        point_room_ids = np.full(point_xyz.shape[0], -1, dtype=np.int32)
+        for local_idx, cam_idx in enumerate(assigned_camera_ids):
+            room_id = int(self.manual_split_assignments[cam_idx])
+            mask = (chosen_cam_local_idx == local_idx).detach().cpu().numpy().astype(np.bool_)
+            point_room_ids[mask] = room_id
+
+        return point_room_ids
+
+    def _build_room_point_masks(self, point_room_ids: np.ndarray) -> Dict[int, np.ndarray]:
+        room_masks: Dict[int, np.ndarray] = {}
+        unique_room_ids = sorted(set([int(v) for v in self.manual_split_assignments.values()]))
+        for room_id in unique_room_ids:
+            room_masks[room_id] = (point_room_ids == room_id)
+        return room_masks
+
+    def _colorize_points_by_room(self):
+        if self.manual_split_point_room_ids is None:
+            print("[WARN] no room assignment for points, please apply split first")
+            return
+
+        if self.manual_split_color_backup_dc is None:
+            self.manual_split_color_backup_dc = self.gaussian_model._features_dc.detach().clone()
+            self.manual_split_color_backup_rest = self.gaussian_model._features_rest.detach().clone()
+
+        with torch.no_grad():
+            current_rgb = SH2RGB(self.gaussian_model._features_dc.squeeze()).detach().clone()
+            room_ids = torch.from_numpy(self.manual_split_point_room_ids).to(current_rgb.device)
+            for room_id in sorted(set([int(v) for v in self.manual_split_assignments.values()])):
+                mask = room_ids == int(room_id)
+                color = torch.tensor(self._room_color(int(room_id)), dtype=current_rgb.dtype, device=current_rgb.device) / 255.0
+                current_rgb[mask] = color
+
+            recolor_dc = RGB2SH(current_rgb).unsqueeze(1)
+            self.gaussian_model._features_dc.copy_(recolor_dc)
+
+        self.update_client()
+        print("[INFO] colorized points by room assignment")
+
+    def _restore_point_colors_after_room_visualization(self):
+        if self.manual_split_color_backup_dc is None:
+            print("[INFO] no backup color to restore")
+            return
+
+        with torch.no_grad():
+            self.gaussian_model._features_dc.copy_(self.manual_split_color_backup_dc)
+            self.gaussian_model._features_rest.copy_(self.manual_split_color_backup_rest)
+
+        self.manual_split_color_backup_dc = None
+        self.manual_split_color_backup_rest = None
+        self.update_client()
+        print("[INFO] restored original point colors")
+
+    def _save_manual_split_data(self):
+        if self.prep_dir is None or self.prep_dir == "":
+            raise ValueError("--prep_dir is empty, cannot save split data")
+        if len(self.manual_split_assignments) == 0:
+            raise ValueError("No camera assignment found")
+
+        split_dir = os.path.join(self.prep_dir, "split")
+        os.makedirs(split_dir, exist_ok=True)
+
+        assigned_camera_ids = sorted(self.manual_split_assignments.keys())
+        point_room_ids = self._compute_point_room_assignments(assigned_camera_ids)
+        room_masks = self._build_room_point_masks(point_room_ids)
+
+        self.manual_split_point_room_ids = point_room_ids
+        self.manual_split_room_point_masks = room_masks
+
+        np.save(os.path.join(split_dir, "point_room_ids.npy"), point_room_ids.astype(np.int32))
+
+        room_point_counts = {
+            str(room_id): int(mask.sum()) for room_id, mask in sorted(room_masks.items(), key=lambda x: x[0])
+        }
+        camera_assignments = {
+            str(cam_idx): {
+                "room_id": int(room_id),
+                "img_name": str(self.camera_poses[cam_idx].get("img_name", f"cam_{cam_idx}")),
+            }
+            for cam_idx, room_id in sorted(self.manual_split_assignments.items(), key=lambda x: x[0])
+        }
+
+        summary = {
+            "num_cameras_total": int(len(self.camera_poses)),
+            "num_cameras_assigned": int(len(self.manual_split_assignments)),
+            "num_points_total": int(point_room_ids.shape[0]),
+            "camera_assignments": camera_assignments,
+            "room_point_counts": room_point_counts,
+        }
+        with open(os.path.join(split_dir, "manual_split_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+        with open(os.path.join(split_dir, "camera_room_assignments.json"), "w", encoding="utf-8") as f:
+            json.dump({str(k): int(v) for k, v in sorted(self.manual_split_assignments.items())}, f, ensure_ascii=False, indent=2)
+
+        for room_id, mask in room_masks.items():
+            np.save(os.path.join(split_dir, f"room_{room_id}_point_mask.npy"), mask.astype(np.uint8))
+
+        print(f"[INFO] split data saved in {split_dir}")
+
+    def _load_manual_split_data(self):
+        if self.prep_dir is None or self.prep_dir == "":
+            return
+        split_dir = os.path.join(self.prep_dir, "split")
+        assignments_path = os.path.join(split_dir, "camera_room_assignments.json")
+        if not os.path.exists(assignments_path):
+            return
+
+        with open(assignments_path, "r", encoding="utf-8") as f:
+            assignments_raw = json.load(f)
+        self.manual_split_assignments = {
+            int(k): int(v)
+            for k, v in assignments_raw.items()
+            if 0 <= int(k) < len(self.camera_poses)
+        }
+        self.manual_split_selected_ids = set()
+
+        point_room_path = os.path.join(split_dir, "point_room_ids.npy")
+        if os.path.exists(point_room_path):
+            self.manual_split_point_room_ids = np.load(point_room_path).astype(np.int32)
+            self.manual_split_room_point_masks = self._build_room_point_masks(self.manual_split_point_room_ids)
+
+    def add_cameras_to_scene(self, viser_server):
+        if len(self.camera_poses) == 0:
+            print("[WARN] no camera poses, cannot add camera frustums")
+            return
+
+        self.camera_handles = []
+        self.camera_handles_by_idx = {}
+        self.camera_handle_names = {}
+        camera_pose_transform = np.linalg.inv(self.camera_transform.cpu().numpy())
+        for idx, camera in enumerate(self.camera_poses):
+            name = camera["img_name"]
+            if camera.get("pose_source", "") == "colmap_fallback":
+                # Keep exactly the same convention as manual_split_viewer for COLMAP fallback.
+                r_wc = np.asarray(camera["rotation"], dtype=np.float32)
+                center = np.asarray(camera["position"], dtype=np.float32)
+                R = vtf.SO3.from_matrix(r_wc) @ vtf.SO3.from_x_radians(np.pi)
+                position = center
+            else:
+                c2w = np.eye(4)
+                c2w[:3, :3] = np.asarray(camera["rotation"])
+                c2w[:3, 3] = np.asarray(camera["position"])
+                c2w[:3, 1:3] *= -1
+                c2w = np.matmul(camera_pose_transform, c2w)
+
+                R = vtf.SO3.from_matrix(c2w[:3, :3])
+                R = R @ vtf.SO3.from_x_radians(np.pi)
+                position = c2w[:3, 3]
 
             cx = camera["width"] // 2
             cy = camera["height"] // 2
@@ -248,26 +659,46 @@ class Viewer:
                 scale=0.05,
                 aspect=float(cx / cy),
                 wxyz=R.wxyz,
-                position=c2w[:3, 3],
+                position=position,
                 color=(255, 255, 0),
             )
 
             @camera_handle.on_click
-            def _(event: viser.SceneNodePointerEvent[viser.CameraFrustumHandle]) -> None:
+            def _(event: viser.SceneNodePointerEvent[viser.CameraFrustumHandle], camera_idx=idx) -> None:
+                if hasattr(self, "manual_split_enable") and self.manual_split_enable.value:
+                    if camera_idx in self.manual_split_selected_ids:
+                        self.manual_split_selected_ids.remove(camera_idx)
+                    else:
+                        self.manual_split_selected_ids.add(camera_idx)
+                    self._refresh_manual_split_camera_colors()
+                    if hasattr(self, "manual_split_status"):
+                        self.manual_split_status.value = self._manual_split_status_text()
+                    return
+
                 with event.client.atomic():
                     event.client.camera.position = event.target.position
                     event.client.camera.wxyz = event.target.wxyz
 
             self.camera_handles.append(camera_handle)
+            self.camera_handles_by_idx[idx] = camera_handle
+            self.camera_handle_names[idx] = name
 
-        self.show_cameras_frustrum = viser_server.add_gui_button("Show Train Cameras")
-        self.camera_visible = True
-        @self.show_cameras_frustrum.on_click
-        def toggle_camera_visibility(_):
-            with viser_server.atomic():
-                self.camera_visible = not self.camera_visible
-                for i in self.camera_handles:
-                    i.visible = self.camera_visible
+        if not hasattr(self, "camera_visible"):
+            self.camera_visible = bool(self.show_cameras)
+        for handle in self.camera_handles:
+            handle.visible = self.camera_visible
+
+        if not hasattr(self, "show_cameras_frustrum"):
+            self.show_cameras_frustrum = viser_server.add_gui_button("Toggle Train Cameras")
+
+            @self.show_cameras_frustrum.on_click
+            def toggle_camera_visibility(_):
+                with viser_server.atomic():
+                    self.camera_visible = not self.camera_visible
+                    for i in self.camera_handles:
+                        i.visible = self.camera_visible
+
+        self._refresh_manual_split_camera_colors()
 
     def start(self, block: bool = True, server_config_fun=None, tab_config_fun=None):
         # create viser server
@@ -1621,7 +2052,7 @@ class Viewer:
                                                 mask_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_mask.png'),
                                                 ref_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
                                                 depth_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
-                                                strength=0.7,
+                                                strength=0.5,
                                                 )
                     styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
                     inpainted_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_inpainted.png'))
@@ -1708,13 +2139,13 @@ class Viewer:
                 'pano_mask_tensor': get_pano_imgs_tensor(E2P.Equirectangular(255-pano_mask)),
             })
 
-            # Load precomputed distance-based pano masks for current stage.
-            for sidx in range(len(styled_imgs)):
-                every_cam_id = styled_imgs[sidx]['cam_id']
-                stage_mask_path = os.path.join(save_dir, f"cam_{idx}", "mask", f"cam_{every_cam_id}", "pano_img.png")
-                if os.path.exists(stage_mask_path):
-                    stage_mask = cv2.imread(stage_mask_path)
-                    styled_imgs[sidx]['pano_mask_tensor'] = get_pano_imgs_tensor(E2P.Equirectangular(stage_mask))
+            # # Load precomputed distance-based pano masks for current stage.
+            # for sidx in range(len(styled_imgs)):
+            #     every_cam_id = styled_imgs[sidx]['cam_id']
+            #     stage_mask_path = os.path.join(save_dir, f"cam_{idx}", "mask", f"cam_{every_cam_id}", "pano_img.png")
+            #     if os.path.exists(stage_mask_path):
+            #         stage_mask = cv2.imread(stage_mask_path)
+            #         styled_imgs[sidx]['pano_mask_tensor'] = get_pano_imgs_tensor(E2P.Equirectangular(stage_mask))
 
             print(f"After save: {self.get_gpu_memory_usage()}")
             torch.cuda.empty_cache()
@@ -1900,6 +2331,49 @@ class Viewer:
                 self.start_refine_button = server.add_gui_button("Start Refine")
                 self.start_pers_button = server.add_gui_button("Start Perspective Stylization")
 
+            with server.add_gui_folder("Manual Room Split"):
+                source_options = ("json", "colmap") if len(self.json_camera_poses) > 0 else ("colmap",)
+                self.camera_pose_source_selector = server.add_gui_button_group(
+                    "Camera Pose Source",
+                    source_options,
+                )
+                self.manual_split_enable = server.add_gui_checkbox(
+                    "Enable Manual Camera Split",
+                    initial_value=False,
+                )
+                self.manual_split_select_mode = server.add_gui_button_group(
+                    "Select Mode",
+                    ("replace", "append"),
+                )
+                self.manual_split_drag_select_enabled = server.add_gui_checkbox(
+                    "Enable Drag Rect Select",
+                    initial_value=False,
+                )
+                self.manual_split_preview_mode = server.add_gui_button_group(
+                    "Split Preview Render",
+                    ("gaussian", "pointcloud"),
+                )
+                self.manual_split_room_id = server.add_gui_slider(
+                    "Current Room ID",
+                    min=0,
+                    max=255,
+                    step=1,
+                    initial_value=1,
+                )
+                self.manual_split_assign_button = server.add_gui_button("Assign Selection To Room")
+                self.manual_split_remove_button = server.add_gui_button("Remove Selection From Room")
+                self.manual_split_select_room_button = server.add_gui_button("Select Cameras In Current Room")
+                self.manual_split_clear_room_button = server.add_gui_button("Clear Current Room")
+                self.manual_split_clear_selection_button = server.add_gui_button("Clear Selection")
+                self.manual_split_undo_button = server.add_gui_button("Undo Last Assignment")
+                self.manual_split_apply_button = server.add_gui_button("Apply Split And Save")
+                self.manual_split_colorize_points_button = server.add_gui_button("Colorize Assigned Points")
+                self.manual_split_restore_points_color_button = server.add_gui_button("Restore Point Colors")
+                self.manual_split_status = server.add_gui_text(
+                    "Split Status",
+                    initial_value="Manual split disabled.",
+                )
+
             with server.add_gui_folder("Render Options"):
                 self.render_type = server.add_gui_dropdown(
                     "Render Type", tuple(self.render_type_name.keys())[:-1]
@@ -2008,8 +2482,12 @@ class Viewer:
                 )
 
             # add cameras
-            if self.show_cameras:
-                self.add_cameras_to_scene(server)
+            self.add_cameras_to_scene(server)
+            self._load_manual_split_data()
+            self._refresh_manual_split_camera_colors()
+            self.manual_split_status.value = self._manual_split_status_text()
+            if hasattr(self, "camera_pose_source_selector"):
+                self.camera_pose_source_selector.value = self.camera_pose_source_active
 
             @self.render_type.on_update
             @self.render_type1.on_update
@@ -2028,6 +2506,144 @@ class Viewer:
             @self.box_z.on_update
             def _(event): 
                 with server.atomic(): self._handle_option_updated(_)
+
+            @self.manual_split_enable.on_update
+            def _(_event):
+                self._update_rect_select_bindings(server)
+                self._refresh_manual_split_camera_colors()
+                self.manual_split_status.value = self._manual_split_status_text()
+
+            @self.camera_pose_source_selector.on_click
+            def _(_event):
+                requested_source = self.camera_pose_source_selector.value
+                active_source = self._set_active_camera_pose_source(requested_source)
+                if active_source != requested_source:
+                    self.camera_pose_source_selector.value = active_source
+                    print(f"[WARN] pose source '{requested_source}' unavailable, fallback to '{active_source}'")
+
+                for handle in self.camera_handles:
+                    try:
+                        handle.remove()
+                    except Exception:
+                        pass
+                self.camera_handles = []
+                self.camera_handles_by_idx = {}
+                self.camera_handle_names = {}
+                self.add_cameras_to_scene(server)
+
+                # Keep split assignments valid after source switch.
+                self.manual_split_selected_ids = set()
+                self.manual_split_assignments = {
+                    cam_idx: room_id
+                    for cam_idx, room_id in self.manual_split_assignments.items()
+                    if 0 <= cam_idx < len(self.camera_poses)
+                }
+
+                if hasattr(self, "training_view_slider"):
+                    self.training_view_slider.max = max(len(self.camera_poses) - 1, 0)
+                    if self.training_view_slider.value > self.training_view_slider.max:
+                        self.training_view_slider.value = self.training_view_slider.max
+
+                self._refresh_manual_split_camera_colors()
+                self.manual_split_status.value = self._manual_split_status_text()
+                print(f"[INFO] camera pose source switched to: {active_source}")
+
+            @self.manual_split_drag_select_enabled.on_update
+            def _(_event):
+                self._update_rect_select_bindings(server)
+                self.manual_split_status.value = self._manual_split_status_text()
+
+            @self.manual_split_preview_mode.on_click
+            def _(_event):
+                if self.manual_split_preview_mode.value == "pointcloud":
+                    self.enable_ptc.value = True
+                    self.surfel_mode.value = "ptc"
+                else:
+                    self.enable_ptc.value = False
+                self._handle_option_updated(_)
+
+            @self.manual_split_clear_selection_button.on_click
+            def _(_event):
+                self.manual_split_selected_ids.clear()
+                self._refresh_manual_split_camera_colors()
+                self.manual_split_status.value = self._manual_split_status_text()
+
+            @self.manual_split_assign_button.on_click
+            def _(_event):
+                if len(self.manual_split_selected_ids) == 0:
+                    print("[INFO] no selected cameras to assign")
+                    return
+                self.manual_split_last_assignments = dict(self.manual_split_assignments)
+                room_id = int(self.manual_split_room_id.value)
+                for cam_idx in self.manual_split_selected_ids:
+                    self.manual_split_assignments[cam_idx] = room_id
+                self._refresh_manual_split_camera_colors()
+                assigned_count = len(self.manual_split_assignments)
+                total_count = len(self.camera_poses)
+                base_status = self._manual_split_status_text()
+                self.manual_split_status.value = f"{base_status} | Assigned Cameras: {assigned_count}/{total_count}"
+                print(f"[INFO] assigned cameras: {assigned_count}/{total_count}")
+
+            @self.manual_split_remove_button.on_click
+            def _(_event):
+                if len(self.manual_split_selected_ids) == 0:
+                    print("[INFO] no selected cameras to remove")
+                    return
+                self.manual_split_last_assignments = dict(self.manual_split_assignments)
+                for cam_idx in list(self.manual_split_selected_ids):
+                    self.manual_split_assignments.pop(cam_idx, None)
+                self._refresh_manual_split_camera_colors()
+                self.manual_split_status.value = self._manual_split_status_text()
+
+            @self.manual_split_select_room_button.on_click
+            def _(_event):
+                room_id = int(self.manual_split_room_id.value)
+                self.manual_split_selected_ids = {
+                    cam_idx for cam_idx, rid in self.manual_split_assignments.items() if rid == room_id
+                }
+                self._refresh_manual_split_camera_colors()
+                self.manual_split_status.value = self._manual_split_status_text()
+
+            @self.manual_split_clear_room_button.on_click
+            def _(_event):
+                room_id = int(self.manual_split_room_id.value)
+                self.manual_split_last_assignments = dict(self.manual_split_assignments)
+                remove_ids = [cam_idx for cam_idx, rid in self.manual_split_assignments.items() if rid == room_id]
+                for cam_idx in remove_ids:
+                    self.manual_split_assignments.pop(cam_idx, None)
+                self._refresh_manual_split_camera_colors()
+                self.manual_split_status.value = self._manual_split_status_text()
+
+            @self.manual_split_undo_button.on_click
+            def _(_event):
+                if self.manual_split_last_assignments is None:
+                    print("[INFO] nothing to undo")
+                    return
+                self.manual_split_assignments = self.manual_split_last_assignments
+                self.manual_split_last_assignments = None
+                self._refresh_manual_split_camera_colors()
+                self.manual_split_status.value = self._manual_split_status_text()
+
+            @self.manual_split_apply_button.on_click
+            def _(_event):
+                try:
+                    self._save_manual_split_data()
+                    self._colorize_points_by_room()
+                    self.manual_split_status.value = self._manual_split_status_text()
+                except Exception as err:
+                    print(f"[WARN] split apply failed: {err}")
+
+            @self.manual_split_colorize_points_button.on_click
+            def _(_event):
+                self._colorize_points_by_room()
+
+            @self.manual_split_restore_points_color_button.on_click
+            def _(_event):
+                self._restore_point_colors_after_room_visualization()
+
+            @server.on_client_connect
+            def _(client: viser.ClientHandle) -> None:
+                self._update_rect_select_bindings(server)
 
             go_to_scene_center = server.add_gui_button("Go to scene center",)
             @go_to_scene_center.on_click
@@ -2193,7 +2809,11 @@ class Viewer:
                 ### Playroom ###
                 # cam_id = [99,98,22,101,147]
                 # cam_id = [-1,173,15,200,29]
-                cam_id = self._get_preprocess_candidate_cam_ids()
+                if len(self.manual_split_assignments) > 0:
+                    cam_id = sorted(self.manual_split_assignments.keys())
+                    print(f"[INFO] use manual split camera list for preprocess: {cam_id}")
+                else:
+                    cam_id = self._get_preprocess_candidate_cam_ids()
                 
                 # cam_centers = sorted(camera_center)
 
@@ -2321,15 +2941,7 @@ class Viewer:
                         out_dir = os.path.join(stage_root, f"cam_{every_id}")
                         os.makedirs(out_dir, exist_ok=True)
 
-                        nearest_point_mask = ((nearest_cam_idx == local_j) & has_visible_camera).detach().cpu().numpy().astype(np.bool_)
-                        # 获取所有非本相机的可见点的mask
-                        other_visible_mask = np.zeros_like(nearest_point_mask)
-                        for other_j, other_id in enumerate(active_cam_ids):
-                            if other_j == local_j: continue
-                            other_visible_mask = other_visible_mask | active_visibility_masks[other_j]
-                        # 从非本相机的可见点中去除最近的点
-                        point_mask = ~(other_visible_mask & (~nearest_point_mask))
-                        
+                        point_mask = ((nearest_cam_idx == local_j) & has_visible_camera).detach().cpu().numpy().astype(np.bool_) & stage_all_point_mask
                         np.save(os.path.join(out_dir, "point_mask.npy"), point_mask)
                         every_center = np.load(os.path.join(save_dir, f"cam_{every_id}", "camera_center.npy"))
                         every_rotation = np.load(os.path.join(save_dir, f"cam_{every_id}", "camera_rotation.npy"))
@@ -2340,7 +2952,7 @@ class Viewer:
                             mask=point_mask,
                             save_dir=out_dir,
                         )
-                        mask = ~((np.array(mask_pano).sum(axis=2)/3/255)<(1-mask_thres))
+                        mask = (np.array(mask_pano).sum(axis=2)/3/255)>mask_thres
                         Image.fromarray(mask.astype(np.uint8)*255).save(os.path.join(out_dir, "pano_mask.png"))
                 
                 print("Preprocess success...")
@@ -2553,6 +3165,8 @@ class Viewer:
         """
 
         try:
+            if client.client_id in self.manual_split_rect_select_clients:
+                self.manual_split_rect_select_clients.remove(client.client_id)
             self.clients[client.client_id].stop()
             del self.clients[client.client_id]
         except Exception as err:
@@ -2579,7 +3193,9 @@ if __name__ == "__main__":
                         action="store_true", default=False,
                         help="Enable transform options on Web UI. May consume more memory")
     parser.add_argument("--show_cameras", "--show-cameras",
-                        action="store_true")
+                        dest="show_cameras", action="store_true", default=False)
+    parser.add_argument("--hide_cameras", "--hide-cameras",
+                        dest="show_cameras", action="store_false")
     parser.add_argument("--cameras-json", "--cameras_json", type=str, default=None)
     parser.add_argument("--up", nargs=3, required=False, type=float, default=None)
     parser.add_argument("--default_camera_position", "--dcp", nargs=3, required=False, type=float, default=None)
