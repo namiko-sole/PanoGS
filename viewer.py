@@ -1621,7 +1621,7 @@ class Viewer:
                                                 mask_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_mask.png'),
                                                 ref_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
                                                 depth_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
-                                                strength=0.7,
+                                                strength=0.5,
                                                 )
                     styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
                     inpainted_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_inpainted.png'))
@@ -1652,7 +1652,7 @@ class Viewer:
             # cur_point_mask = point_mask.copy()
             # point_mask = np.logical_or(point_mask, prev_mask)
             cam_mask = (all_point_mask!=prev_all_point_mask) if i!=0 else all_point_mask
-            cam_point_mask = np.load(os.path.join(save_dir, f'cam_{idx}', 'mask', f'cam_{idx}', 'point_mask.npy')).astype(np.bool_) if i!=0 else all_point_mask
+            # cam_point_mask = np.load(os.path.join(save_dir, f'cam_{idx}', 'mask', f'cam_{idx}', 'point_mask.npy')).astype(np.bool_) if i!=0 else all_point_mask
             _feat_dc_visible, _feat_rest_visible = self.color_update_proj(
                 # camera_center_path="/data/hyh/github/2D-GS-Viser-Viewer/preprocess/playroom_cartoon/cam_center/camera_center.npy",
                 # styled_img_path="/data/hyh/github/2D-GS-Viser-Viewer/preprocess/playroom_cartoon/cam_center/pano_styled.png",
@@ -1662,7 +1662,8 @@ class Viewer:
                 camera_rotation=camera_rotation,
                 styled_img_path=os.path.join(save_dir, f"cam_{idx}", "styled", "pano_styled_refined.png"),
                 depth_path=os.path.join(save_dir, f"cam_{idx}", "pano_depth.npy"),
-                point_mask=cam_point_mask,
+                point_mask=cam_mask,
+                # point_mask=cam_point_mask,
                 upscale=4,
                 color_gaussian=True,
             )
@@ -1672,10 +1673,10 @@ class Viewer:
             else:
                 # feat_dc_visible[cur_point_mask] = (_feat_dc_visible[cur_point_mask] + feat_dc_visible[cur_point_mask])/2
                 # feat_rest_visible[cur_point_mask] = (_feat_rest_visible[cur_point_mask] + feat_rest_visible[cur_point_mask])/2
-                # feat_dc_visible[cam_mask] = _feat_dc_visible[cam_mask]
-                # feat_rest_visible[cam_mask] = _feat_rest_visible[cam_mask]
-                feat_dc_visible[cam_point_mask] = _feat_dc_visible[cam_point_mask]
-                feat_rest_visible[cam_point_mask] = _feat_rest_visible[cam_point_mask]
+                feat_dc_visible[cam_mask] = _feat_dc_visible[cam_mask]
+                feat_rest_visible[cam_mask] = _feat_rest_visible[cam_mask]
+                # feat_dc_visible[cam_point_mask] = _feat_dc_visible[cam_point_mask]
+                # feat_rest_visible[cam_point_mask] = _feat_rest_visible[cam_point_mask]
                 # feat_dc_visible[cur_point_mask] = _feat_dc_visible[cur_point_mask]
                 # feat_rest_visible[cur_point_mask] = _feat_rest_visible[cur_point_mask]
 
@@ -1708,13 +1709,13 @@ class Viewer:
                 'pano_mask_tensor': get_pano_imgs_tensor(E2P.Equirectangular(255-pano_mask)),
             })
 
-            # Load precomputed distance-based pano masks for current stage.
-            for sidx in range(len(styled_imgs)):
-                every_cam_id = styled_imgs[sidx]['cam_id']
-                stage_mask_path = os.path.join(save_dir, f"cam_{idx}", "mask", f"cam_{every_cam_id}", "pano_img.png")
-                if os.path.exists(stage_mask_path):
-                    stage_mask = cv2.imread(stage_mask_path)
-                    styled_imgs[sidx]['pano_mask_tensor'] = get_pano_imgs_tensor(E2P.Equirectangular(stage_mask))
+            # # Load precomputed distance-based pano masks for current stage.
+            # for sidx in range(len(styled_imgs)):
+            #     every_cam_id = styled_imgs[sidx]['cam_id']
+            #     stage_mask_path = os.path.join(save_dir, f"cam_{idx}", "mask", f"cam_{every_cam_id}", "pano_img.png")
+            #     if os.path.exists(stage_mask_path):
+            #         stage_mask = cv2.imread(stage_mask_path)
+            #         styled_imgs[sidx]['pano_mask_tensor'] = get_pano_imgs_tensor(E2P.Equirectangular(stage_mask))
 
             print(f"After save: {self.get_gpu_memory_usage()}")
             torch.cuda.empty_cache()
@@ -2279,69 +2280,69 @@ class Viewer:
                         all_point_mask = all_point_mask | cur_point_mask
                         np.save(os.path.join(save_dir, f"cam_{id}", "pano_mask_all.npy"), all_point_mask)
 
-                print("Precomputing staged distance-based pano masks...")
-                point_xyz = self.gaussian_model.get_xyz.detach()
-                for stage_i, stage_id in enumerate(tqdm(cam_id)):
-                    stage_root = os.path.join(save_dir, f"cam_{stage_id}", "mask")
-                    stage_all_point_mask = np.load(os.path.join(save_dir, f"cam_{stage_id}", "pano_mask_all.npy")).astype(np.bool_)
-                    os.makedirs(stage_root, exist_ok=True)
+                # print("Precomputing staged distance-based pano masks...")
+                # point_xyz = self.gaussian_model.get_xyz.detach()
+                # for stage_i, stage_id in enumerate(tqdm(cam_id)):
+                #     stage_root = os.path.join(save_dir, f"cam_{stage_id}", "mask")
+                #     stage_all_point_mask = np.load(os.path.join(save_dir, f"cam_{stage_id}", "pano_mask_all.npy")).astype(np.bool_)
+                #     os.makedirs(stage_root, exist_ok=True)
 
-                    active_cam_ids = cam_id[: stage_i + 1]
-                    active_centers = []
-                    active_visibility_masks = []
-                    for active_id in active_cam_ids:
-                        center = np.load(os.path.join(save_dir, f"cam_{active_id}", "camera_center.npy"))
-                        active_centers.append(center)
-                        vis_mask = np.load(os.path.join(save_dir, f"cam_{active_id}", "pano_mask.npy")).astype(np.bool_)
-                        active_visibility_masks.append(vis_mask)
+                #     active_cam_ids = cam_id[: stage_i + 1]
+                #     active_centers = []
+                #     active_visibility_masks = []
+                #     for active_id in active_cam_ids:
+                #         center = np.load(os.path.join(save_dir, f"cam_{active_id}", "camera_center.npy"))
+                #         active_centers.append(center)
+                #         vis_mask = np.load(os.path.join(save_dir, f"cam_{active_id}", "pano_mask.npy")).astype(np.bool_)
+                #         active_visibility_masks.append(vis_mask)
 
-                    if len(active_cam_ids) == 1:
-                        only_id = active_cam_ids[0]
-                        out_dir = os.path.join(stage_root, f"cam_{only_id}")
-                        os.makedirs(out_dir, exist_ok=True)
-                        pano_img = cv2.imread(os.path.join(save_dir, f"cam_{stage_id}", "pano_img.png"))
-                        full_mask = np.ones(pano_img.shape[:2], dtype=np.uint8) * 255
-                        full_mask = cv2.cvtColor(full_mask, cv2.COLOR_GRAY2RGB)
-                        Image.fromarray(full_mask).save(os.path.join(out_dir, "pano_mask.png"))
-                        continue
+                #     if len(active_cam_ids) == 1:
+                #         only_id = active_cam_ids[0]
+                #         out_dir = os.path.join(stage_root, f"cam_{only_id}")
+                #         os.makedirs(out_dir, exist_ok=True)
+                #         pano_img = cv2.imread(os.path.join(save_dir, f"cam_{stage_id}", "pano_img.png"))
+                #         full_mask = np.ones(pano_img.shape[:2], dtype=np.uint8) * 255
+                #         full_mask = cv2.cvtColor(full_mask, cv2.COLOR_GRAY2RGB)
+                #         Image.fromarray(full_mask).save(os.path.join(out_dir, "pano_mask.png"))
+                #         continue
 
-                    active_centers_t = torch.tensor(
-                        np.stack(active_centers, axis=0),
-                        dtype=point_xyz.dtype,
-                        device=point_xyz.device,
-                    )
-                    dist_to_active = torch.cdist(point_xyz, active_centers_t)
-                    visible_mat = torch.from_numpy(np.stack(active_visibility_masks, axis=1)).to(point_xyz.device)
-                    inf_dist = torch.full_like(dist_to_active, float("inf"))
-                    visible_dist = torch.where(visible_mat, dist_to_active, inf_dist)
-                    nearest_cam_idx = torch.argmin(visible_dist, dim=1)
-                    has_visible_camera = torch.isfinite(torch.min(visible_dist, dim=1).values)
+                #     active_centers_t = torch.tensor(
+                #         np.stack(active_centers, axis=0),
+                #         dtype=point_xyz.dtype,
+                #         device=point_xyz.device,
+                #     )
+                #     dist_to_active = torch.cdist(point_xyz, active_centers_t)
+                #     visible_mat = torch.from_numpy(np.stack(active_visibility_masks, axis=1)).to(point_xyz.device)
+                #     inf_dist = torch.full_like(dist_to_active, float("inf"))
+                #     visible_dist = torch.where(visible_mat, dist_to_active, inf_dist)
+                #     nearest_cam_idx = torch.argmin(visible_dist, dim=1)
+                #     has_visible_camera = torch.isfinite(torch.min(visible_dist, dim=1).values)
 
-                    for local_j, every_id in enumerate(active_cam_ids):
-                        out_dir = os.path.join(stage_root, f"cam_{every_id}")
-                        os.makedirs(out_dir, exist_ok=True)
+                #     for local_j, every_id in enumerate(active_cam_ids):
+                #         out_dir = os.path.join(stage_root, f"cam_{every_id}")
+                #         os.makedirs(out_dir, exist_ok=True)
 
-                        nearest_point_mask = ((nearest_cam_idx == local_j) & has_visible_camera).detach().cpu().numpy().astype(np.bool_)
-                        # 获取所有非本相机的可见点的mask
-                        other_visible_mask = np.zeros_like(nearest_point_mask)
-                        for other_j, other_id in enumerate(active_cam_ids):
-                            if other_j == local_j: continue
-                            other_visible_mask = other_visible_mask | active_visibility_masks[other_j]
-                        # 从非本相机的可见点中去除最近的点
-                        point_mask = ~(other_visible_mask & (~nearest_point_mask))
+                #         nearest_point_mask = ((nearest_cam_idx == local_j) & has_visible_camera).detach().cpu().numpy().astype(np.bool_)
+                #         # 获取所有非本相机的可见点的mask
+                #         other_visible_mask = np.zeros_like(nearest_point_mask)
+                #         for other_j, other_id in enumerate(active_cam_ids):
+                #             if other_j == local_j: continue
+                #             other_visible_mask = other_visible_mask | active_visibility_masks[other_j]
+                #         # 从非本相机的可见点中去除最近的点
+                #         point_mask = ~(other_visible_mask & (~nearest_point_mask))
                         
-                        np.save(os.path.join(out_dir, "point_mask.npy"), point_mask)
-                        every_center = np.load(os.path.join(save_dir, f"cam_{every_id}", "camera_center.npy"))
-                        every_rotation = np.load(os.path.join(save_dir, f"cam_{every_id}", "camera_rotation.npy"))
+                #         np.save(os.path.join(out_dir, "point_mask.npy"), point_mask)
+                #         every_center = np.load(os.path.join(save_dir, f"cam_{every_id}", "camera_center.npy"))
+                #         every_rotation = np.load(os.path.join(save_dir, f"cam_{every_id}", "camera_rotation.npy"))
 
-                        mask_pano, _ = self.render_panorama(
-                            every_center,
-                            camera_rotation=every_rotation,
-                            mask=point_mask,
-                            save_dir=out_dir,
-                        )
-                        mask = ~((np.array(mask_pano).sum(axis=2)/3/255)<(1-mask_thres))
-                        Image.fromarray(mask.astype(np.uint8)*255).save(os.path.join(out_dir, "pano_mask.png"))
+                #         mask_pano, _ = self.render_panorama(
+                #             every_center,
+                #             camera_rotation=every_rotation,
+                #             mask=point_mask,
+                #             save_dir=out_dir,
+                #         )
+                #         mask = ~((np.array(mask_pano).sum(axis=2)/3/255)<(1-mask_thres))
+                #         Image.fromarray(mask.astype(np.uint8)*255).save(os.path.join(out_dir, "pano_mask.png"))
                 
                 print("Preprocess success...")
 

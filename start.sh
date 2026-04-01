@@ -17,20 +17,20 @@
 # --port 8088
 
 
-CUDA_VISIBLE_DEVICES=6 \
+CUDA_VISIBLE_DEVICES=2 \
 python -u viewer.py \
-/nas1/hyh22/backup/PanoGS/colmap_spliter/output_data_big_room_d918a_2dgs_submodels/room_1/colmap_submodel/output/point_cloud/iteration_30000/point_cloud.ply \
--s /nas1/hyh22/backup/PanoGS/colmap_spliter/output_data_big_room_d918a_2dgs_submodels/room_1/colmap_submodel \
---cameras_json /nas1/hyh22/backup/PanoGS/colmap_spliter/output_data_big_room_d918a_2dgs_submodels/room_1/colmap_submodel/output/cameras.json \
+/nas1/hyh22/backup/PanoGS/colmap_spliter/output_rooms_d918a/room_5/colmap_submodel/output/point_cloud/iteration_30000/point_cloud.ply \
+-s /nas1/hyh22/backup/PanoGS/colmap_spliter/output_rooms_d918a/room_5/colmap_submodel \
+--cameras_json /nas1/hyh22/backup/PanoGS/colmap_spliter/output_rooms_d918a/room_5/colmap_submodel/output/cameras.json \
 --style_img /nas1/hyh22/backup/PanoGS/style_data/indoor/room3.jpg \
---prep_dir preprocess/d918a_r1_cnn_room3 \
---port 8090
+--prep_dir preprocess/manual_d918a_r5_cnn_room3_adaptive_mini_tvloss1e-3_pretrain100_strength0.5_nodynamic \
+--port 8060
 
-CUDA_VISIBLE_DEVICES=4 \
-python -u viewer.py \
-/nas1/hyh22/backup/PanoGS/colmap_spliter/output_rooms_d918a/room_1/colmap_submodel/output/point_cloud/iteration_30000/point_cloud.ply \
--s /nas1/hyh22/backup/PanoGS/colmap_spliter/output_rooms_d918a/room_1/colmap_submodel \
---cameras_json /nas1/hyh22/backup/PanoGS/colmap_spliter/output_rooms_d918a/room_1/colmap_submodel/output/cameras.json \
+CUDA_VISIBLE_DEVICES=5 \
+python -u viewer_big_room.py \
+/nas1/hyh22/backup/PanoGS/data_big_room_d918a_2dgs/output/point_cloud/iteration_30000/point_cloud.ply \
+-s /nas1/hyh22/backup/PanoGS/data_big_room_d918a_2dgs/ \
+--cameras_json /nas1/hyh22/backup/PanoGS/data_big_room_d918a_2dgs/output/cameras.json \
 --style_img /nas1/hyh22/backup/PanoGS/style_data/indoor/room3.jpg \
---prep_dir preprocess/manual_d918a_r1_cnn_room3_adaptive_mini_tvloss0.1 \
+--prep_dir preprocess/manual_d918a_big_room_cnn_room3_tvloss0.1_mpointcloud \
 --port 8092

@@ -192,7 +192,7 @@ def generate_image(prompt, style_img_path, input_img_path, ref_img_path, depth_i
     
     input_img = load_image(input_img_path)
     ref_img = load_image(ref_img_path)
-    detected_map = cv2.Canny(np.array(ref_img), 50, 200)
+    detected_map = cv2.Canny(np.array(ref_img), 50, 150)
     # canny_map = Image.fromarray(cv2.cvtColor(detected_map, cv2.COLOR_BGR2RGB))
     canny_map = Image.fromarray(detected_map).resize((input_img.width, input_img.height))
 
@@ -341,9 +341,9 @@ def generate_image(prompt, style_img_path, input_img_path, ref_img_path, depth_i
     return images[0]
 
 if __name__ == "__main__":
-    input = "preprocess/manual_d918a_cnn_room3_adaptive_mini/cam_23/styled/pano_img.png"
+    input = "preprocess/manual_d918a_r3_cnn_room3_adaptive_mini_tvloss1e-3_pretrain100_strength0.7/cam_52/styled/pano_img.png"
     style = "style_data/indoor/room3.jpg"
-    ref = "preprocess/manual_d918a_cnn_room3_adaptive_mini/cam_23/pano_img.png"
+    ref = "preprocess/manual_d918a_r3_cnn_room3_adaptive_mini_tvloss1e-3_pretrain100_strength0.7/cam_52/pano_img.png"
 
     # image = generate_adain(content_path=input,
     #                style_path=style,
@@ -353,10 +353,10 @@ if __name__ == "__main__":
                             style_img_path=style,
                             input_img_path=input,
                             # input_img_path=input,
-                            mask_img_path="preprocess/manual_d918a_cnn_room3_adaptive_mini/cam_23/pano_mask.png",
+                            mask_img_path="preprocess/manual_d918a_r3_cnn_room3_adaptive_mini_tvloss1e-3_pretrain100_strength0.7/cam_52/pano_mask.png",
                             ref_img_path=ref,
                             depth_img_path=ref,
-                            strength=0.9,
+                            strength=0.3,
                             )
     image.save("temp1.png")
     # mid.save("temp2.png")

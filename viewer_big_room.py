@@ -494,17 +494,69 @@ class Viewer:
         nearest_any_idx = torch.argmin(dist_to_camera, dim=1)
 
         visible_mat = torch.from_numpy(np.stack(visibility_masks, axis=1)).to(point_xyz.device)
-        inf_dist = torch.full_like(dist_to_camera, float("inf"))
-        visible_dist = torch.where(visible_mat, dist_to_camera, inf_dist)
-        nearest_visible_idx = torch.argmin(visible_dist, dim=1)
-        has_visible_camera = torch.isfinite(torch.min(visible_dist, dim=1).values)
-        chosen_cam_local_idx = torch.where(has_visible_camera, nearest_visible_idx, nearest_any_idx)
+        # Room-level assignment: combine nearest visible distance with a penalty
+        # when a room has weak multi-view support for a point.
+        room_ids_per_cam = np.asarray(
+            [int(self.manual_split_assignments[cam_idx]) for cam_idx in assigned_camera_ids],
+            dtype=np.int32,
+        )
+        unique_room_ids = sorted(set(room_ids_per_cam.tolist()))
 
-        point_room_ids = np.full(point_xyz.shape[0], -1, dtype=np.int32)
-        for local_idx, cam_idx in enumerate(assigned_camera_ids):
-            room_id = int(self.manual_split_assignments[cam_idx])
-            mask = (chosen_cam_local_idx == local_idx).detach().cpu().numpy().astype(np.bool_)
-            point_room_ids[mask] = room_id
+        room_k_nearest = 2
+        support_expected = 2.0
+        support_penalty_lambda = 0.8
+
+        num_points = point_xyz.shape[0]
+        num_rooms = len(unique_room_ids)
+        room_scores = torch.full(
+            (num_points, num_rooms),
+            float("inf"),
+            dtype=dist_to_camera.dtype,
+            device=dist_to_camera.device,
+        )
+
+        inf_dist = torch.full_like(dist_to_camera, float("inf"))
+        for room_local_idx, room_id in enumerate(unique_room_ids):
+            room_cam_mask_np = room_ids_per_cam == int(room_id)
+            if not np.any(room_cam_mask_np):
+                continue
+
+            room_cam_mask = torch.from_numpy(room_cam_mask_np).to(dist_to_camera.device)
+            room_dist = dist_to_camera[:, room_cam_mask]
+            room_visible = visible_mat[:, room_cam_mask]
+
+            room_visible_dist = torch.where(room_visible, room_dist, inf_dist[:, room_cam_mask])
+            k_eff = min(room_k_nearest, int(room_visible_dist.shape[1]))
+            topk_dist = torch.topk(room_visible_dist, k=k_eff, dim=1, largest=False).values
+            topk_finite = torch.isfinite(topk_dist)
+            topk_count = topk_finite.sum(dim=1)
+
+            topk_sum = torch.where(topk_finite, topk_dist, torch.zeros_like(topk_dist)).sum(dim=1)
+            mean_topk_dist = torch.where(
+                topk_count > 0,
+                topk_sum / topk_count.clamp(min=1),
+                torch.full((num_points,), float("inf"), dtype=dist_to_camera.dtype, device=dist_to_camera.device),
+            )
+
+            visible_count = room_visible.sum(dim=1).to(dist_to_camera.dtype)
+            support_gap = torch.clamp((support_expected - visible_count) / support_expected, min=0.0)
+            support_penalty = 1.0 + support_penalty_lambda * support_gap
+
+            room_scores[:, room_local_idx] = mean_topk_dist * support_penalty
+
+        best_room_local_idx = torch.argmin(room_scores, dim=1)
+        best_room_score = torch.min(room_scores, dim=1).values
+        has_visible_room_support = torch.isfinite(best_room_score)
+
+        room_ids_per_cam_t = torch.from_numpy(room_ids_per_cam).to(dist_to_camera.device)
+        fallback_room_ids = room_ids_per_cam_t[nearest_any_idx]
+        chosen_room_ids = torch.where(
+            has_visible_room_support,
+            torch.tensor(unique_room_ids, dtype=room_ids_per_cam_t.dtype, device=room_ids_per_cam_t.device)[best_room_local_idx],
+            fallback_room_ids,
+        )
+
+        point_room_ids = chosen_room_ids.detach().cpu().numpy().astype(np.int32)
 
         return point_room_ids
 
@@ -1039,7 +1091,7 @@ class Viewer:
             return 0, 0
 
         cam_dirs = sorted(
-            path for path in glob.glob(os.path.join(prep_path, "cam_*")) if os.path.isdir(path)
+            path for path in glob.glob(os.path.join(prep_path, "**", "cam_*"), recursive=True) if os.path.isdir(path)
         )
         removed_count = 0
         for cam_dir in cam_dirs:
@@ -1157,6 +1209,40 @@ class Viewer:
         if self.enable_camera_center.value:
             filtered_cam_id.insert(0, -1)
         return filtered_cam_id
+
+    def _resolve_preprocess_room_groups(self, prefer_manual_split: bool = True) -> Tuple[Dict[int, List[int]], str]:
+        candidate_cam_ids = [int(cam_idx) for cam_idx in self._get_preprocess_candidate_cam_ids()]
+
+        if prefer_manual_split and len(self.manual_split_assignments) > 0:
+            room_groups: Dict[int, List[int]] = {}
+            skipped_special_ids: List[int] = []
+            unassigned_candidate_ids: List[int] = []
+
+            for cam_idx in candidate_cam_ids:
+                if cam_idx < 0:
+                    skipped_special_ids.append(cam_idx)
+                    continue
+
+                room_id = self.manual_split_assignments.get(cam_idx)
+                if room_id is None:
+                    unassigned_candidate_ids.append(cam_idx)
+                    continue
+
+                room_groups.setdefault(int(room_id), []).append(cam_idx)
+
+            if len(room_groups) > 0:
+                if len(skipped_special_ids) > 0:
+                    print(f"[INFO] skip special candidate IDs in manual grouping: {skipped_special_ids}")
+                if len(unassigned_candidate_ids) > 0:
+                    print(
+                        f"[INFO] candidate cameras without manual room assignment are skipped: "
+                        f"count={len(unassigned_candidate_ids)}"
+                    )
+                return room_groups, "auto_candidate_manual_split_grouped"
+
+            print("[WARN] no candidate cameras matched manual split assignments, fallback to auto candidates")
+
+        return {-1: candidate_cam_ids}, "auto_candidate"
 
     def color_update_style_bak(self):
         raw_rgbs = (SH2RGB(self.gaussian_model._features_dc.squeeze()).detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
@@ -1286,7 +1372,7 @@ class Viewer:
             self.gaussian_model._features_dc = _features_dc
             self.gaussian_model._features_rest = _features_rest
         
-    def color_update_proj(self, camera_center_path, camera_rotation, styled_img_path, depth_path, point_mask, upscale=1, color_gaussian=True):
+    def color_update_proj(self, camera_center_path, camera_rotation, styled_img_path, depth_path, point_mask, upscale=1, color_gaussian=True, room_scope_mask=None):
         from internal.utils.pano_utils import direction_to_pano_coord, pano_to_img_coord
 
         camera_center = np.load(camera_center_path)
@@ -1343,7 +1429,15 @@ class Viewer:
         # pano_vis = pt_map.numpy()
 
         # pano_vis = np.load(point_mask).astype(np.bool_)
-        pano_vis = point_mask
+        pano_vis = np.asarray(point_mask).astype(np.bool_)
+        point_count = self.gaussian_model.get_xyz.shape[0]
+        if pano_vis.shape[0] != point_count:
+            raise ValueError(f"point_mask size mismatch: {pano_vis.shape[0]} vs {point_count}")
+        if room_scope_mask is not None:
+            room_scope_mask = np.asarray(room_scope_mask).astype(np.bool_)
+            if room_scope_mask.shape[0] != point_count:
+                raise ValueError(f"room_scope_mask size mismatch: {room_scope_mask.shape[0]} vs {point_count}")
+            pano_vis = pano_vis & room_scope_mask
 
         # pano_vis = None
         # masks = np.load(mask_path)
@@ -1379,20 +1473,50 @@ class Viewer:
         # return _features_dc, _features_rest
         return features[:, :, 0:1].transpose(1, 2), features[:, :, 1:].transpose(1, 2)
     
-    def hidden_color_propogation(self, point_mask_path):
+    def hidden_color_propogation(self, point_mask_path=None, point_mask=None, room_scope_mask=None):
         print("Propogating Color...")
 
-        point_mask = np.load(point_mask_path).astype(np.bool_)
+        if point_mask is None:
+            if point_mask_path is None:
+                raise ValueError("Either point_mask_path or point_mask must be provided")
+            point_mask = np.load(point_mask_path).astype(np.bool_)
+        else:
+            point_mask = np.asarray(point_mask).astype(np.bool_)
+
+        point_count = self.gaussian_model.get_xyz.shape[0]
+        if point_mask.shape[0] != point_count:
+            raise ValueError(f"point_mask size mismatch: {point_mask.shape[0]} vs {point_count}")
+
+        if room_scope_mask is not None:
+            room_scope_mask = np.asarray(room_scope_mask).astype(np.bool_)
+            if room_scope_mask.shape[0] != point_count:
+                raise ValueError(f"room_scope_mask size mismatch: {room_scope_mask.shape[0]} vs {point_count}")
+            visible_mask = point_mask & room_scope_mask
+            hidden_mask = (~point_mask) & room_scope_mask
+        else:
+            visible_mask = point_mask
+            hidden_mask = ~point_mask
+
+        if not np.any(visible_mask):
+            print("[INFO] skip propagation: no visible points in current scope")
+            return
+        if not np.any(hidden_mask):
+            print("[INFO] skip propagation: no hidden points in current scope")
+            return
 
         # point_centers = self.gaussian_model.get_xyz
         # _, nn_idx = K_nearest_neighbors(point_centers[point_mask], 5, point_centers[~point_mask])
         # nn_feat_dc = self.gaussian_model._features_dc[point_mask][nn_idx]
         # nn_feat_rest = self.gaussian_model._features_rest[point_mask][nn_idx]
         
+        if self.knn_number.value <= 0:
+            print("[INFO] skip propagation: KNN number <= 0")
+            return
+
         point_color = self.raw_features_dc[:,0,:]
-        _, nn_idx = K_nearest_neighbors(point_color[point_mask], self.knn_number.value, point_color[~point_mask])
-        nn_feat_dc = self.gaussian_model._features_dc[point_mask][nn_idx]
-        nn_feat_rest = self.gaussian_model._features_rest[point_mask][nn_idx]
+        _, nn_idx = K_nearest_neighbors(point_color[visible_mask], self.knn_number.value, point_color[hidden_mask])
+        nn_feat_dc = self.gaussian_model._features_dc[visible_mask][nn_idx]
+        nn_feat_rest = self.gaussian_model._features_rest[visible_mask][nn_idx]
 
         mean_feat_dc = nn_feat_dc.mean(axis=1)#, keepdim=True)
         mean_feat_rest = nn_feat_rest.mean(axis=1)#, keepdim=True)
@@ -1400,8 +1524,8 @@ class Viewer:
             mean_feat_dc = mean_feat_dc.unsqueeze(1)
             mean_feat_rest = mean_feat_rest.unsqueeze(1)
         with torch.no_grad():
-            self.gaussian_model._features_dc[~point_mask] = mean_feat_dc
-            self.gaussian_model._features_rest[~point_mask] = mean_feat_rest
+            self.gaussian_model._features_dc[hidden_mask] = mean_feat_dc
+            self.gaussian_model._features_rest[hidden_mask] = mean_feat_rest
 
         # colors = SH2RGB(self.gaussian_model._features_dc)
         # recolored = nnfm_utils.match_colors_for_point_cloud(colors, colors[point_mask])[0]
@@ -1415,6 +1539,17 @@ class Viewer:
 
         # print("KNN Time Cost: " + str(time.time()-start_time))
         pass
+
+    def _zero_feature_grads_outside_room(self, room_scope_mask_t: Optional[torch.Tensor]):
+        if room_scope_mask_t is None:
+            return
+
+        with torch.no_grad():
+            outside_mask = ~room_scope_mask_t
+            if self.gaussian_model._features_dc.grad is not None:
+                self.gaussian_model._features_dc.grad[outside_mask] = 0
+            if self.gaussian_model._features_rest.grad is not None:
+                self.gaussian_model._features_rest.grad[outside_mask] = 0
 
     def retrain_scene(self, save_dir):
         opt = OptimizationParams(
@@ -1543,8 +1678,21 @@ class Viewer:
         print('Number of Gaussians after pretraining:', self.gaussian_model._features_dc.shape[0])
         self.gaussian_model.save_ply(os.path.join(save_dir, 'scene_retrained.ply'))
 
-    def color_update(self, cam_id, save_dir): #camera_center_path, styled_img_path):
+    def color_update(self, cam_id, save_dir, room_point_mask=None, room_id=None): #camera_center_path, styled_img_path):
         print("Reading and processing images...")
+
+        room_scope_mask = None
+        if room_point_mask is not None:
+            room_scope_mask = np.asarray(room_point_mask).astype(np.bool_)
+            if room_scope_mask.shape[0] != self.gaussian_model.get_xyz.shape[0]:
+                raise ValueError(
+                    f"room scope mask size mismatch: {room_scope_mask.shape[0]} vs {self.gaussian_model.get_xyz.shape[0]}"
+                )
+
+        room_tag = f"room_{room_id}" if room_id is not None else "all"
+        if room_id is not None and room_id != -1 and room_scope_mask is None:
+            raise ValueError(f"room_{room_id} stylization requires a valid room_point_mask")
+        print(f"[INFO] color_update start for {room_tag}, cameras={len(cam_id)}")
 
         # sobel_operator = SobelOperator().to(self.device)
         # gray_scale = RGB2Gray().to(self.device)
@@ -1773,11 +1921,36 @@ class Viewer:
             # train_steps = 1500 if steps==0 else self.train_steps.value
             train_steps = steps
 
+            room_scope_mask_np = None
+            room_scope_mask_t = None
+            if room_scope_mask is not None:
+                room_scope_mask_np = np.asarray(room_scope_mask).astype(np.bool_)
+                if room_scope_mask_np.shape[0] != self.gaussian_model.get_xyz.shape[0]:
+                    raise ValueError(
+                        f"room_scope_mask size mismatch in train_pano: {room_scope_mask_np.shape[0]} vs {self.gaussian_model.get_xyz.shape[0]}"
+                    )
+                room_scope_mask_t = torch.from_numpy(room_scope_mask_np).to(
+                    device=self.gaussian_model._features_dc.device,
+                    dtype=torch.bool,
+                )
+
             # point_centers = self.gaussian_model.get_xyz
             # _, nn_idx = K_nearest_neighbors(point_centers[all_point_mask], 5, point_centers[~all_point_mask])
 
+            visible_mask = all_point_mask
+            if room_scope_mask_np is not None:
+                visible_mask = visible_mask & room_scope_mask_np
+                hidden_mask = room_scope_mask_np & (~visible_mask)
+            else:
+                hidden_mask = ~visible_mask
+
+            has_visible = bool(np.any(visible_mask))
+            has_hidden = bool(np.any(hidden_mask))
+
             point_color = self.raw_features_dc[:,0,:]
-            _, nn_idx = K_nearest_neighbors(point_color[all_point_mask], self.knn_number.value, point_color[~all_point_mask])
+            nn_idx = None
+            if has_visible and has_hidden and self.knn_number.value > 0:
+                _, nn_idx = K_nearest_neighbors(point_color[visible_mask], self.knn_number.value, point_color[hidden_mask])
 
             # nn_feat_dc = self.gaussian_model._features_dc[point_mask][nn_idx]
             # nn_feat_rest = self.gaussian_model._features_rest[point_mask][nn_idx]
@@ -1865,18 +2038,20 @@ class Viewer:
                     # perceptual_loss = perceptual(rendered.permute(2,0,1)[None], raw_image.permute(2,0,1)[None])
                     # loss += color_loss #+ perceptual_loss#+ sobel_loss #+ perceptual_loss
 
-                project_loss = l1_loss(self.gaussian_model._features_dc[all_point_mask], feat_dc[all_point_mask]) + \
-                                l1_loss(self.gaussian_model._features_rest[all_point_mask],feat_rest[all_point_mask])
+                if has_visible:
+                    project_loss = l1_loss(self.gaussian_model._features_dc[visible_mask], feat_dc[visible_mask]) + \
+                                    l1_loss(self.gaussian_model._features_rest[visible_mask],feat_rest[visible_mask])
 
-                nn_feat_dc = self.gaussian_model._features_dc[all_point_mask][nn_idx]
-                nn_feat_rest = self.gaussian_model._features_rest[all_point_mask][nn_idx]
-                mean_feat_dc = nn_feat_dc.mean(axis=1)
-                mean_feat_rest = nn_feat_rest.mean(axis=1)
-                if self.knn_number.value==1:
-                    mean_feat_dc = mean_feat_dc.unsqueeze(1)
-                    mean_feat_rest = mean_feat_rest.unsqueeze(1)
-                propagate_loss = l1_loss(self.gaussian_model._features_dc[~all_point_mask], mean_feat_dc) + \
-                                l1_loss(self.gaussian_model._features_rest[~all_point_mask], mean_feat_rest)
+                if has_visible and has_hidden and nn_idx is not None:
+                    nn_feat_dc = self.gaussian_model._features_dc[visible_mask][nn_idx]
+                    nn_feat_rest = self.gaussian_model._features_rest[visible_mask][nn_idx]
+                    mean_feat_dc = nn_feat_dc.mean(axis=1)
+                    mean_feat_rest = nn_feat_rest.mean(axis=1)
+                    if self.knn_number.value==1:
+                        mean_feat_dc = mean_feat_dc.unsqueeze(1)
+                        mean_feat_rest = mean_feat_rest.unsqueeze(1)
+                    propagate_loss = l1_loss(self.gaussian_model._features_dc[hidden_mask], mean_feat_dc) + \
+                                    l1_loss(self.gaussian_model._features_rest[hidden_mask], mean_feat_rest)
 
                 loss = 0.8*color_loss/6 + 0.2*ssim_loss/6 + 1*propagate_loss + 1*project_loss + 1e-3*tv_loss/6
                 # loss = 1*color_loss + 1*propagate_loss + 10*project_loss
@@ -1894,6 +2069,7 @@ class Viewer:
                     self.update_client()
                 torch.cuda.empty_cache()
                 loss.backward(retain_graph=True)
+                self._zero_feature_grads_outside_room(room_scope_mask_t)
                 self.gaussian_model.optimizer.step()
                 self.gaussian_model.optimizer.zero_grad(set_to_none=True)
 
@@ -1988,9 +2164,21 @@ class Viewer:
             # pano_mask = cv2.imread(os.path.join(save_dir, f'cam_{idx}', 'pano_mask.png'), cv2.IMREAD_GRAYSCALE) if i!=0 else np.zeros((res, res*2), dtype=np.uint8)
             # pano_mask = cv2.erode(pano_mask, np.ones((3,3), np.uint8), iterations=3)
             # pano_mask = cv2.cvtColor(pano_mask, cv2.COLOR_GRAY2RGB)
-            prev_all_point_mask = np.load(os.path.join(save_dir, f'cam_{cam_id[i-1]}', 'pano_mask_all.npy')).astype(np.bool_)
             cur_point_mask = np.load(os.path.join(save_dir, f'cam_{idx}', 'pano_mask.npy')).astype(np.bool_)
             all_point_mask = np.load(os.path.join(save_dir, f'cam_{idx}', 'pano_mask_all.npy')).astype(np.bool_)
+            if room_scope_mask is not None:
+                cur_point_mask = cur_point_mask & room_scope_mask
+                all_point_mask = all_point_mask & room_scope_mask
+            if i != 0:
+                prev_all_point_mask = np.load(os.path.join(save_dir, f'cam_{cam_id[i-1]}', 'pano_mask_all.npy')).astype(np.bool_)
+                if room_scope_mask is not None:
+                    prev_all_point_mask = prev_all_point_mask & room_scope_mask
+            else:
+                prev_all_point_mask = np.zeros_like(all_point_mask, dtype=np.bool_)
+
+            if not np.any(all_point_mask):
+                print(f"[INFO] skip cam_{idx} in {room_tag}: no room points visible")
+                continue
             # if not os.path.exists(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_img.png')):
             #     r_image, r_depth = self.render_panorama(camera_center, save_dir=os.path.join(save_dir, f'cam_{idx}', 'styled'))
             r_image, r_depth = self.check_and_render_panorama(camera_center, camera_rotation, save_dir=os.path.join(save_dir, f'cam_{idx}', 'styled'))
@@ -2052,7 +2240,7 @@ class Viewer:
                                                 mask_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_mask.png'),
                                                 ref_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
                                                 depth_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
-                                                strength=0.5,
+                                                strength=0.3,
                                                 )
                     styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
                     inpainted_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_inpainted.png'))
@@ -2083,7 +2271,14 @@ class Viewer:
             # cur_point_mask = point_mask.copy()
             # point_mask = np.logical_or(point_mask, prev_mask)
             cam_mask = (all_point_mask!=prev_all_point_mask) if i!=0 else all_point_mask
-            cam_point_mask = np.load(os.path.join(save_dir, f'cam_{idx}', 'mask', f'cam_{idx}', 'point_mask.npy')).astype(np.bool_) if i!=0 else all_point_mask
+            if room_scope_mask is not None:
+                cam_mask = cam_mask & room_scope_mask
+            # cam_point_mask = np.load(os.path.join(save_dir, f'cam_{idx}', 'mask', f'cam_{idx}', 'point_mask.npy')).astype(np.bool_) if i!=0 else all_point_mask
+            # if room_scope_mask is not None:
+            #     cam_point_mask = cam_point_mask & room_scope_mask
+            # if not np.any(cam_point_mask):
+            #     print(f"[INFO] skip cam_{idx} projection update in {room_tag}: empty cam_point_mask")
+            #     continue
             _feat_dc_visible, _feat_rest_visible = self.color_update_proj(
                 # camera_center_path="/data/hyh/github/2D-GS-Viser-Viewer/preprocess/playroom_cartoon/cam_center/camera_center.npy",
                 # styled_img_path="/data/hyh/github/2D-GS-Viser-Viewer/preprocess/playroom_cartoon/cam_center/pano_styled.png",
@@ -2093,9 +2288,10 @@ class Viewer:
                 camera_rotation=camera_rotation,
                 styled_img_path=os.path.join(save_dir, f"cam_{idx}", "styled", "pano_styled_refined.png"),
                 depth_path=os.path.join(save_dir, f"cam_{idx}", "pano_depth.npy"),
-                point_mask=cam_point_mask,
+                point_mask=cam_mask,
                 upscale=4,
                 color_gaussian=True,
+                room_scope_mask=room_scope_mask,
             )
             if feat_dc_visible is None:
                 feat_dc_visible = _feat_dc_visible
@@ -2103,16 +2299,16 @@ class Viewer:
             else:
                 # feat_dc_visible[cur_point_mask] = (_feat_dc_visible[cur_point_mask] + feat_dc_visible[cur_point_mask])/2
                 # feat_rest_visible[cur_point_mask] = (_feat_rest_visible[cur_point_mask] + feat_rest_visible[cur_point_mask])/2
-                # feat_dc_visible[cam_mask] = _feat_dc_visible[cam_mask]
-                # feat_rest_visible[cam_mask] = _feat_rest_visible[cam_mask]
-                feat_dc_visible[cam_point_mask] = _feat_dc_visible[cam_point_mask]
-                feat_rest_visible[cam_point_mask] = _feat_rest_visible[cam_point_mask]
+                feat_dc_visible[cam_mask] = _feat_dc_visible[cam_mask]
+                feat_rest_visible[cam_mask] = _feat_rest_visible[cam_mask]
+                # feat_dc_visible[cam_point_mask] = _feat_dc_visible[cam_point_mask]
+                # feat_rest_visible[cam_point_mask] = _feat_rest_visible[cam_point_mask]
                 # feat_dc_visible[cur_point_mask] = _feat_dc_visible[cur_point_mask]
                 # feat_rest_visible[cur_point_mask] = _feat_rest_visible[cur_point_mask]
 
             self.viewer_renderer.update_pc_features()
 
-            self.hidden_color_propogation(os.path.join(save_dir, f"cam_{idx}", "pano_mask_all.npy"))
+            self.hidden_color_propogation(point_mask=all_point_mask, room_scope_mask=room_scope_mask)
             self.viewer_renderer.update_pc_features()
 
             # equ_styled_img = E2P.Equirectangular(np.array(styled_img))
@@ -2789,172 +2985,172 @@ class Viewer:
 
                 # return
                 print(len(self.camera_poses))
-                cam_id = self._get_preprocess_candidate_cam_ids()
-                print(f"Candidate Length: {len(cam_id)} | List: {cam_id}")
+                room_groups, camera_id_source = self._resolve_preprocess_room_groups(prefer_manual_split=True)
+                print(f"[INFO] preprocess_test camera id source: {camera_id_source}")
+                for room_id, cam_id in sorted(room_groups.items(), key=lambda x: x[0]):
+                    room_label = "all" if room_id == -1 else f"room_{room_id}"
+                    print(f"[INFO] preprocess_test {room_label} | Candidate Length: {len(cam_id)} | List: {cam_id}")
+
                 if self.render_test_panorama.value:
                     os.makedirs("test_render_pano", exist_ok=True)
-                    for id in cam_id:
-                        target_camera = self.camera_poses[id]
-                        image, depth = self.render_panorama(np.array(target_camera['position']), camera_rotation=np.array(target_camera['rotation']), res=256)
-                        save_file_path = os.path.join("test_render_pano", f'pano_img_cam{id}.png')
-                        Image.fromarray(image.astype(np.uint8)).save(save_file_path)
-                        print(f"Save in {save_file_path}")
+                    for room_id, cam_id in sorted(room_groups.items(), key=lambda x: x[0]):
+                        room_label = "all" if room_id == -1 else f"room_{room_id}"
+                        room_render_dir = os.path.join("test_render_pano", room_label)
+                        os.makedirs(room_render_dir, exist_ok=True)
+                        for id in cam_id:
+                            if id == -1:
+                                camera_center = np.array([0, 0, 0])
+                                camera_rotation = np.diag(np.ones((3)))
+                            else:
+                                target_camera = self.camera_poses[id]
+                                camera_center = np.array(target_camera['position'])
+                                camera_rotation = np.array(target_camera['rotation'])
+                            image, depth = self.render_panorama(camera_center, camera_rotation=camera_rotation, res=256)
+                            save_file_path = os.path.join(room_render_dir, f'pano_img_cam{id}.png')
+                            Image.fromarray(image.astype(np.uint8)).save(save_file_path)
+                            print(f"Save in {save_file_path}")
 
             @self.preprocess_stylization_button.on_click
             def _(_):
-                # self.pano_distort = self.get_pano_depth_distort()
-
-                # sample_camera_number = 5
-
-                ### Playroom ###
-                # cam_id = [99,98,22,101,147]
-                # cam_id = [-1,173,15,200,29]
-                if len(self.manual_split_assignments) > 0:
-                    cam_id = sorted(self.manual_split_assignments.keys())
-                    print(f"[INFO] use manual split camera list for preprocess: {cam_id}")
-                else:
-                    cam_id = self._get_preprocess_candidate_cam_ids()
-                
-                # cam_centers = sorted(camera_center)
-
-                ### Delete Near Camera ###
-                # last_center = np.array([0,0,0])
-                # flag = []
-                # for i in range(len(cam_id)):
-                #     center = np.array(self.camera_poses[cam_id[i]]['position'])
-                #     if np.linalg.norm(center - last_center) < 1:
-                #         flag.append(False)
-                #     else:
-                #         flag.append(True)
-                #         last_center = center
-                # cam_id = [cam_id[idx] for idx,tf in enumerate(flag) if tf==True]
-                # print(cam_id)
-
-                print(f"Candidate Length: {len(cam_id)} | List: {cam_id}")
-                
-
-                # print("test render...")
-                # test_render_dir = "test_render_preprocess"
-                # os.makedirs(test_render_dir, exist_ok=True)
-                # with torch.no_grad():
-                #     for idx, id in tqdm(enumerate(cam_id)):
-                #         if id == -1:
-                #             camera_center = np.array([0,0,0])
-                #             camera_rotation = np.eye(3)
-                #         else:
-                #             cam = self.camera_poses[id]
-                #             camera_center = np.array(cam['position'])
-                #             camera_rotation = np.array(cam['rotation'])
-                        
-                #         image, depth = self.render_panorama(camera_center, res=256)
-                #         Image.fromarray(image.astype(np.uint8)).save(os.path.join(test_render_dir, f'pano_img_cam{idx}.png'))
-                
-                # save_dir = 'preprocess/drjohnson_office_refine'
                 save_dir = self.prep_dir
                 os.makedirs(save_dir, exist_ok=True)
+
+                room_groups, camera_id_source = self._resolve_preprocess_room_groups(prefer_manual_split=True)
+                if camera_id_source == "auto_candidate_manual_split_grouped":
+                    print(f"[INFO] preprocess with manual split rooms: {sorted(room_groups.keys())}")
+                else:
+                    print("[INFO] preprocess with auto camera candidates")
+
                 preprocess_json = {
-                    'cam_id': cam_id,
                     'save_dir': save_dir,
                     'camera_distance_stats': getattr(self, 'last_preprocess_camera_distance_stats', None),
+                    'camera_id_source': camera_id_source,
+                }
+                if -1 in room_groups:
+                    preprocess_json['cam_id'] = room_groups[-1]
+                preprocess_json['room_groups'] = {
+                    str(room_id): cam_list for room_id, cam_list in sorted(room_groups.items(), key=lambda x: x[0])
                 }
                 with open(os.path.join(save_dir, "preprocess.json"), 'w', encoding='utf-8') as f:
                     json.dump(preprocess_json, f, ensure_ascii=False, indent=4)
 
                 mask_thres = 0.9
-                all_point_mask = np.zeros(self.gaussian_model.get_xyz.shape[0], dtype=np.uint8)
-                # cur_point_mask = np.zeros(self.gaussian_model.get_xyz.shape[0], dtype=np.uint8)
-                with torch.no_grad():
-                    for idx, id in tqdm(enumerate(cam_id)):
-                        if os.path.exists(os.path.join(save_dir, f"cam_{id}", "pano_mask_all.npy")): continue
-                        if id == -1:
-                            camera_center = np.array([0,0,0])
-                            camera_rotation = np.diag(np.ones((3)))
-                        else:
-                            cam = self.camera_poses[id]
-                            camera_center = np.array(cam['position'])
-                            if self.camera_focus.value:
-                                camera_rotation = np.array(cam['rotation'])
-                            else:
-                                camera_rotation = np.diag(np.ones((3)))
-                        
-                        image, depth = self.check_and_render_panorama(camera_center, camera_rotation, save_dir=os.path.join(save_dir, f"cam_{id}"))
-                        if idx!=0:
-                            image_mask, depth_mask = self.check_and_render_panorama(camera_center, camera_rotation, mask=all_point_mask, save_dir=os.path.join(save_dir, f"cam_{id}", "mask"))
-                            mask = (np.array(image_mask).sum(axis=2)/3/255)>mask_thres
-                            Image.fromarray(mask.astype(np.uint8)*255).save(os.path.join(save_dir, f"cam_{id}", "pano_mask.png"))
-                            masked_image = np.array(image.copy())
-                            masked_image[~mask] = 0
-                            Image.fromarray(masked_image.astype(np.uint8)).save(os.path.join(save_dir, f"cam_{id}", "pano_img_masked.png"))
-                            
-                            mask = cv2.erode(mask.astype(np.uint8), np.ones((3,3), np.uint8), iterations=3)
-                            Image.fromarray(mask.astype(np.uint8)*255).save(os.path.join(save_dir, f"cam_{id}", "pano_mask_eroded.png"))
-                        else:
-                            os.makedirs(os.path.join(save_dir, f"cam_{id}", "mask"), exist_ok=True)
-                            Image.fromarray(np.zeros_like(image).astype(np.uint8)*255).save(os.path.join(save_dir, f"cam_{id}", "pano_mask.png"))
-                            Image.fromarray(np.zeros_like(image).astype(np.uint8)*255).save(os.path.join(save_dir, f"cam_{id}", "pano_mask_eroded.png"))
-                            Image.fromarray(np.zeros_like(image).astype(np.uint8)*255).save(os.path.join(save_dir, f"cam_{id}", "mask", "pano_img.png"))
-                        
-                        cur_point_map, cur_point_mask = get_hidden_point_mask(self.gaussian_model.get_xyz, camera_center)
-                        np.save(os.path.join(save_dir, f"cam_{id}", "pano_mask.npy"), cur_point_mask)
-                        all_point_mask = all_point_mask | cur_point_mask
-                        np.save(os.path.join(save_dir, f"cam_{id}", "pano_mask_all.npy"), all_point_mask)
-
-                print("Precomputing staged distance-based pano masks...")
                 point_xyz = self.gaussian_model.get_xyz.detach()
-                for stage_i, stage_id in enumerate(tqdm(cam_id)):
-                    stage_root = os.path.join(save_dir, f"cam_{stage_id}", "mask")
-                    stage_all_point_mask = np.load(os.path.join(save_dir, f"cam_{stage_id}", "pano_mask_all.npy")).astype(np.bool_)
-                    os.makedirs(stage_root, exist_ok=True)
 
-                    active_cam_ids = cam_id[: stage_i + 1]
-                    active_centers = []
-                    active_visibility_masks = []
-                    for active_id in active_cam_ids:
-                        center = np.load(os.path.join(save_dir, f"cam_{active_id}", "camera_center.npy"))
-                        active_centers.append(center)
-                        vis_mask = np.load(os.path.join(save_dir, f"cam_{active_id}", "pano_mask.npy")).astype(np.bool_)
-                        active_visibility_masks.append(vis_mask)
+                for room_id, cam_id in sorted(room_groups.items(), key=lambda x: x[0]):
+                    room_label = "all" if room_id == -1 else f"room_{room_id}"
+                    room_save_dir = save_dir if room_id == -1 else os.path.join(save_dir, room_label)
+                    os.makedirs(room_save_dir, exist_ok=True)
 
-                    if len(active_cam_ids) == 1:
-                        only_id = active_cam_ids[0]
-                        out_dir = os.path.join(stage_root, f"cam_{only_id}")
-                        os.makedirs(out_dir, exist_ok=True)
-                        pano_img = cv2.imread(os.path.join(save_dir, f"cam_{stage_id}", "pano_img.png"))
-                        full_mask = np.ones(pano_img.shape[:2], dtype=np.uint8) * 255
-                        full_mask = cv2.cvtColor(full_mask, cv2.COLOR_GRAY2RGB)
-                        Image.fromarray(full_mask).save(os.path.join(out_dir, "pano_mask.png"))
-                        continue
+                    print(f"[INFO] preprocess {room_label}, Candidate Length: {len(cam_id)} | List: {cam_id}")
+                    all_point_mask = np.zeros(self.gaussian_model.get_xyz.shape[0], dtype=np.bool_)
 
-                    active_centers_t = torch.tensor(
-                        np.stack(active_centers, axis=0),
-                        dtype=point_xyz.dtype,
-                        device=point_xyz.device,
-                    )
-                    dist_to_active = torch.cdist(point_xyz, active_centers_t)
-                    visible_mat = torch.from_numpy(np.stack(active_visibility_masks, axis=1)).to(point_xyz.device)
-                    inf_dist = torch.full_like(dist_to_active, float("inf"))
-                    visible_dist = torch.where(visible_mat, dist_to_active, inf_dist)
-                    nearest_cam_idx = torch.argmin(visible_dist, dim=1)
-                    has_visible_camera = torch.isfinite(torch.min(visible_dist, dim=1).values)
+                    with torch.no_grad():
+                        for idx, id in tqdm(enumerate(cam_id), desc=f"preprocess-{room_label}"):
+                            cam_root = os.path.join(room_save_dir, f"cam_{id}")
+                            if os.path.exists(os.path.join(cam_root, "pano_mask_all.npy")):
+                                continue
 
-                    for local_j, every_id in enumerate(active_cam_ids):
-                        out_dir = os.path.join(stage_root, f"cam_{every_id}")
-                        os.makedirs(out_dir, exist_ok=True)
+                            if id == -1:
+                                camera_center = np.array([0,0,0])
+                                camera_rotation = np.diag(np.ones((3)))
+                            else:
+                                cam = self.camera_poses[id]
+                                camera_center = np.array(cam['position'])
+                                if self.camera_focus.value:
+                                    camera_rotation = np.array(cam['rotation'])
+                                else:
+                                    camera_rotation = np.diag(np.ones((3)))
 
-                        point_mask = ((nearest_cam_idx == local_j) & has_visible_camera).detach().cpu().numpy().astype(np.bool_) & stage_all_point_mask
-                        np.save(os.path.join(out_dir, "point_mask.npy"), point_mask)
-                        every_center = np.load(os.path.join(save_dir, f"cam_{every_id}", "camera_center.npy"))
-                        every_rotation = np.load(os.path.join(save_dir, f"cam_{every_id}", "camera_rotation.npy"))
+                            image, depth = self.check_and_render_panorama(camera_center, camera_rotation, save_dir=cam_root)
+                            if idx != 0:
+                                image_mask, depth_mask = self.check_and_render_panorama(
+                                    camera_center,
+                                    camera_rotation,
+                                    mask=all_point_mask,
+                                    save_dir=os.path.join(cam_root, "mask"),
+                                )
+                                mask = (np.array(image_mask).sum(axis=2)/3/255) > mask_thres
+                                Image.fromarray(mask.astype(np.uint8)*255).save(os.path.join(cam_root, "pano_mask.png"))
+                                masked_image = np.array(image.copy())
+                                masked_image[~mask] = 0
+                                Image.fromarray(masked_image.astype(np.uint8)).save(os.path.join(cam_root, "pano_img_masked.png"))
 
-                        mask_pano, _ = self.render_panorama(
-                            every_center,
-                            camera_rotation=every_rotation,
-                            mask=point_mask,
-                            save_dir=out_dir,
-                        )
-                        mask = (np.array(mask_pano).sum(axis=2)/3/255)>mask_thres
-                        Image.fromarray(mask.astype(np.uint8)*255).save(os.path.join(out_dir, "pano_mask.png"))
-                
+                                mask = cv2.erode(mask.astype(np.uint8), np.ones((3,3), np.uint8), iterations=3)
+                                Image.fromarray(mask.astype(np.uint8)*255).save(os.path.join(cam_root, "pano_mask_eroded.png"))
+                            else:
+                                os.makedirs(os.path.join(cam_root, "mask"), exist_ok=True)
+                                Image.fromarray(np.zeros_like(image).astype(np.uint8)*255).save(os.path.join(cam_root, "pano_mask.png"))
+                                Image.fromarray(np.zeros_like(image).astype(np.uint8)*255).save(os.path.join(cam_root, "pano_mask_eroded.png"))
+                                Image.fromarray(np.zeros_like(image).astype(np.uint8)*255).save(os.path.join(cam_root, "mask", "pano_img.png"))
+
+                            cur_point_map, cur_point_mask = get_hidden_point_mask(self.gaussian_model.get_xyz, camera_center)
+                            cur_point_mask = cur_point_mask.astype(np.bool_)
+                            np.save(os.path.join(cam_root, "pano_mask.npy"), cur_point_mask)
+                            all_point_mask = all_point_mask | cur_point_mask
+                            np.save(os.path.join(cam_root, "pano_mask_all.npy"), all_point_mask)
+
+                    # print(f"Precomputing staged distance-based pano masks for {room_label}...")
+                    # for stage_i, stage_id in enumerate(tqdm(cam_id, desc=f"stage-mask-{room_label}")):
+                    #     stage_root = os.path.join(room_save_dir, f"cam_{stage_id}", "mask")
+                    #     os.makedirs(stage_root, exist_ok=True)
+
+                    #     active_cam_ids = cam_id[: stage_i + 1]
+                    #     active_centers = []
+                    #     active_visibility_masks = []
+                    #     for active_id in active_cam_ids:
+                    #         center = np.load(os.path.join(room_save_dir, f"cam_{active_id}", "camera_center.npy"))
+                    #         active_centers.append(center)
+                    #         vis_mask = np.load(os.path.join(room_save_dir, f"cam_{active_id}", "pano_mask.npy")).astype(np.bool_)
+                    #         active_visibility_masks.append(vis_mask)
+
+                    #     if len(active_cam_ids) == 1:
+                    #         only_id = active_cam_ids[0]
+                    #         out_dir = os.path.join(stage_root, f"cam_{only_id}")
+                    #         os.makedirs(out_dir, exist_ok=True)
+                    #         pano_img = cv2.imread(os.path.join(room_save_dir, f"cam_{stage_id}", "pano_img.png"))
+                    #         full_mask = np.ones(pano_img.shape[:2], dtype=np.uint8) * 255
+                    #         full_mask = cv2.cvtColor(full_mask, cv2.COLOR_GRAY2RGB)
+                    #         Image.fromarray(full_mask).save(os.path.join(out_dir, "pano_mask.png"))
+                    #         continue
+
+                    #     active_centers_t = torch.tensor(
+                    #         np.stack(active_centers, axis=0),
+                    #         dtype=point_xyz.dtype,
+                    #         device=point_xyz.device,
+                    #     )
+                    #     dist_to_active = torch.cdist(point_xyz, active_centers_t)
+                    #     visible_mat = torch.from_numpy(np.stack(active_visibility_masks, axis=1)).to(point_xyz.device)
+                    #     inf_dist = torch.full_like(dist_to_active, float("inf"))
+                    #     visible_dist = torch.where(visible_mat, dist_to_active, inf_dist)
+                    #     nearest_cam_idx = torch.argmin(visible_dist, dim=1)
+                    #     has_visible_camera = torch.isfinite(torch.min(visible_dist, dim=1).values)
+
+                    #     for local_j, every_id in enumerate(active_cam_ids):
+                    #         out_dir = os.path.join(stage_root, f"cam_{every_id}")
+                    #         os.makedirs(out_dir, exist_ok=True)
+
+                    #         nearest_point_mask = ((nearest_cam_idx == local_j) & has_visible_camera).detach().cpu().numpy().astype(np.bool_)
+                    #         other_visible_mask = np.zeros_like(nearest_point_mask)
+                    #         for other_j, other_id in enumerate(active_cam_ids):
+                    #             if other_j == local_j:
+                    #                 continue
+                    #             other_visible_mask = other_visible_mask | active_visibility_masks[other_j]
+                    #         point_mask = ~(other_visible_mask & (~nearest_point_mask))
+
+                    #         np.save(os.path.join(out_dir, "point_mask.npy"), point_mask)
+                    #         every_center = np.load(os.path.join(room_save_dir, f"cam_{every_id}", "camera_center.npy"))
+                    #         every_rotation = np.load(os.path.join(room_save_dir, f"cam_{every_id}", "camera_rotation.npy"))
+
+                    #         mask_pano, _ = self.render_panorama(
+                    #             every_center,
+                    #             camera_rotation=every_rotation,
+                    #             mask=point_mask,
+                    #             save_dir=out_dir,
+                    #         )
+                    #         mask = ~((np.array(mask_pano).sum(axis=2)/3/255) < (1-mask_thres))
+                    #         Image.fromarray(mask.astype(np.uint8)*255).save(os.path.join(out_dir, "pano_mask.png"))
+
                 print("Preprocess success...")
 
             @self.clear_prep_cache_button.on_click
@@ -2972,7 +3168,6 @@ class Viewer:
                 save_dir = self.prep_dir
                 with open(os.path.join(save_dir, "preprocess.json"), 'r', encoding='utf-8') as f:
                     prep_json = json.load(f)
-                cam_id = prep_json['cam_id']
                 
                 self.raw_features_dc = self.gaussian_model._features_dc.clone()
                 self.raw_features_rest = self.gaussian_model._features_rest.clone()
@@ -3001,7 +3196,27 @@ class Viewer:
 
                 self.gaussian_model.active_sh_degree = 3
 
-                self.color_update(cam_id, save_dir)
+                room_groups = prep_json.get('room_groups', None)
+                if isinstance(room_groups, dict) and len(room_groups) > 0:
+                    for room_id_text, room_cam_ids in sorted(room_groups.items(), key=lambda x: int(x[0])):
+                        room_id = int(room_id_text)
+                        room_save_dir = save_dir if room_id == -1 else os.path.join(save_dir, f"room_{room_id}")
+                        if not os.path.isdir(room_save_dir):
+                            print(f"[WARN] room preprocess dir not found, skip room_{room_id}: {room_save_dir}")
+                            continue
+
+                        room_point_mask = None
+                        room_mask_path = os.path.join(save_dir, "split", f"room_{room_id}_point_mask.npy")
+                        if room_id != -1 and os.path.exists(room_mask_path):
+                            room_point_mask = np.load(room_mask_path).astype(np.bool_)
+                        elif room_id != -1 and room_id in self.manual_split_room_point_masks:
+                            room_point_mask = self.manual_split_room_point_masks[room_id].astype(np.bool_)
+
+                        print(f"[INFO] start stylization for room_{room_id}, cameras={len(room_cam_ids)}")
+                        self.color_update(room_cam_ids, room_save_dir, room_point_mask=room_point_mask, room_id=room_id)
+                else:
+                    cam_id = prep_json['cam_id']
+                    self.color_update(cam_id, save_dir)
                 self.update_client()
                 print("update success.")
             
@@ -3014,7 +3229,12 @@ class Viewer:
                     prep_json = json.load(f)
                 
                 # cam_id = [112,99,10]
-                cam_id = prep_json['cam_id']
+                cam_id = prep_json.get('cam_id', None)
+                if cam_id is None:
+                    room_groups = prep_json.get('room_groups', {})
+                    cam_id = []
+                    for _room_id, room_cam_ids in sorted(room_groups.items(), key=lambda x: int(x[0])):
+                        cam_id.extend(room_cam_ids)
 
                 self.color_refine(cam_id, save_dir)
                 self.update_client()
