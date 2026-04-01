@@ -155,6 +155,10 @@ class Viewer:
         self.manual_split_last_assignments: Optional[Dict[int, int]] = None
         self.manual_split_room_point_masks: Dict[int, np.ndarray] = {}
         self.manual_split_point_room_ids: Optional[np.ndarray] = None
+        self.manual_split_selected_point_mask: Optional[np.ndarray] = None
+        self.manual_split_point_xyz_cache: Optional[np.ndarray] = None
+        self.manual_split_selected_point_preview_backup_dc: Optional[torch.Tensor] = None
+        self.manual_split_selected_point_preview_color: Tuple[int, int, int] = (255, 0, 255)
         self.camera_handles_by_idx: Dict[int, viser.CameraFrustumHandle] = {}
         self.camera_handle_names: Dict[int, str] = {}
         self.manual_split_rect_select_clients: Set[int] = set()
@@ -163,6 +167,27 @@ class Viewer:
         self.camera_pose_source_active: str = "colmap"
         self.manual_split_color_backup_dc: Optional[torch.Tensor] = None
         self.manual_split_color_backup_rest: Optional[torch.Tensor] = None
+        self.manual_split_is_applying: bool = False
+
+        # Tunable weights for point-room assignment after manual camera split.
+        self.room_assign_k_nearest: int = 2
+        self.room_assign_support_expected: float = 2.0
+        self.room_assign_support_penalty_lambda: float = 0.8
+        self.room_assign_dist_weight: float = 1.0
+        self.room_assign_center_weight: float = 0.15
+        self.room_assign_color_weight: float = 0.35
+        self.room_assign_support_reward_weight: float = 0.12
+        self.room_assign_conf_margin_threshold: float = 0.08
+        self.room_assign_graph_refine_enable: bool = True
+        self.room_assign_graph_knn: int = 12
+        self.room_assign_graph_lambda: float = 0.35
+        self.room_assign_graph_sigma_x: float = 0.0
+        self.room_assign_graph_sigma_c: float = 0.15
+        self.room_assign_graph_iters: int = 6
+        self.room_assign_graph_only_low_conf: bool = True
+        self.room_assign_graph_low_conf_margin: float = 0.12
+        self.room_assign_graph_use_normal_consistency: bool = True
+        self.room_assign_graph_normal_weight: float = 0.8
 
         # init model & scene 
         self._init_models(iterations)
@@ -283,10 +308,185 @@ class Viewer:
             room_msg = "none"
         else:
             room_msg = ", ".join([f"room_{rid}:{room_counts[rid]}" for rid in sorted(room_counts.keys())])
+
+        selected_points = 0
+        if self.manual_split_selected_point_mask is not None:
+            selected_points = int(np.count_nonzero(self.manual_split_selected_point_mask))
+
+        assigned_points = 0
+        total_points = int(self.gaussian_model.get_xyz.shape[0]) if hasattr(self, "gaussian_model") else 0
+        if self.manual_split_point_room_ids is not None:
+            assigned_points = int(np.count_nonzero(self.manual_split_point_room_ids >= 0))
+
         return (
             f"Selected: {len(self.manual_split_selected_ids)} | Assigned: {len(self.manual_split_assignments)} / {len(self.camera_poses)} | "
-            f"Rooms: {room_msg}"
+            f"Rooms: {room_msg} | PointSel: {selected_points} | PointAssigned: {assigned_points}/{total_points}"
         )
+
+    def _manual_split_visibility_dir(self) -> Optional[str]:
+        if not self.prep_dir:
+            return None
+        split_dir = os.path.join(self.prep_dir, "split")
+        visibility_dir = os.path.join(split_dir, "visibility")
+        os.makedirs(visibility_dir, exist_ok=True)
+        return visibility_dir
+
+    def _get_camera_point_visibility_mask(self, cam_idx: int, point_xyz: torch.Tensor) -> np.ndarray:
+        vis_mask = None
+        visibility_dir = self._manual_split_visibility_dir()
+        vis_path = None
+        if visibility_dir is not None:
+            vis_path = os.path.join(visibility_dir, f"cam_{cam_idx}_point_visible.npy")
+            if os.path.exists(vis_path):
+                vis_mask = np.load(vis_path).astype(np.bool_)
+
+        if vis_mask is None:
+            center = np.array(self.camera_poses[cam_idx]["position"], dtype=np.float32)
+            vis_mask = self._compute_visibility_mask_spherical_zbuffer(
+                point_xyz=point_xyz,
+                camera_center=center,
+            )
+            if vis_path is not None:
+                np.save(vis_path, vis_mask.astype(np.uint8))
+
+        return vis_mask
+
+    def _manual_split_select_points_from_selected_cameras(self, mode: str) -> int:
+        if len(self.manual_split_selected_ids) == 0:
+            raise ValueError("no selected cameras")
+
+        point_xyz = self.gaussian_model.get_xyz.detach()
+        hit_mask = np.zeros((point_xyz.shape[0],), dtype=np.bool_)
+        for cam_idx in sorted(self.manual_split_selected_ids):
+            if cam_idx < 0 or cam_idx >= len(self.camera_poses):
+                continue
+            hit_mask |= self._get_camera_point_visibility_mask(cam_idx, point_xyz)
+
+        if self.manual_split_selected_point_mask is None or mode == "replace":
+            self.manual_split_selected_point_mask = hit_mask
+        elif mode == "append":
+            self.manual_split_selected_point_mask |= hit_mask
+        elif mode == "subtract":
+            self.manual_split_selected_point_mask &= (~hit_mask)
+        else:
+            raise ValueError(f"unsupported point select mode: {mode}")
+
+        self._refresh_manual_split_point_selection_preview()
+
+        return int(np.count_nonzero(hit_mask))
+
+    def _manual_split_assign_selected_points_to_room(self, room_id: int) -> int:
+        if self.manual_split_selected_point_mask is None:
+            raise ValueError("no selected points")
+
+        point_count = int(self.gaussian_model.get_xyz.shape[0])
+        if self.manual_split_point_room_ids is None:
+            self.manual_split_point_room_ids = np.full((point_count,), -1, dtype=np.int32)
+
+        if self.manual_split_point_room_ids.shape[0] != point_count:
+            raise ValueError("point_room_ids size mismatch")
+
+        selected = self.manual_split_selected_point_mask.astype(np.bool_)
+        changed = int(np.count_nonzero(selected))
+        self.manual_split_point_room_ids[selected] = int(room_id)
+        self.manual_split_room_point_masks = self._build_room_point_masks(self.manual_split_point_room_ids)
+        self._refresh_manual_split_point_selection_preview()
+        return changed
+
+    def _manual_split_unassign_selected_points(self) -> int:
+        if self.manual_split_selected_point_mask is None:
+            raise ValueError("no selected points")
+        if self.manual_split_point_room_ids is None:
+            return 0
+
+        selected = self.manual_split_selected_point_mask.astype(np.bool_)
+        changed = int(np.count_nonzero(selected & (self.manual_split_point_room_ids >= 0)))
+        self.manual_split_point_room_ids[selected] = -1
+        self.manual_split_room_point_masks = self._build_room_point_masks(self.manual_split_point_room_ids)
+        self._refresh_manual_split_point_selection_preview()
+        return changed
+
+    def _clear_manual_split_point_selection_preview(self):
+        if self.manual_split_selected_point_preview_backup_dc is None:
+            return
+
+        with torch.no_grad():
+            self.gaussian_model._features_dc.copy_(self.manual_split_selected_point_preview_backup_dc)
+        self.manual_split_selected_point_preview_backup_dc = None
+        self.update_client()
+
+    def _refresh_manual_split_point_selection_preview(self):
+        if not hasattr(self, "manual_split_preview_selected_points"):
+            return
+
+        preview_enabled = bool(self.manual_split_preview_selected_points.value)
+        has_selection = (
+            self.manual_split_selected_point_mask is not None
+            and bool(np.any(self.manual_split_selected_point_mask))
+        )
+
+        if (not preview_enabled) or (not has_selection):
+            self._clear_manual_split_point_selection_preview()
+            return
+
+        # Always restore before re-applying highlight to avoid stacking edits.
+        if self.manual_split_selected_point_preview_backup_dc is not None:
+            with torch.no_grad():
+                self.gaussian_model._features_dc.copy_(self.manual_split_selected_point_preview_backup_dc)
+
+        with torch.no_grad():
+            base_dc = self.gaussian_model._features_dc.detach().clone()
+            current_rgb = SH2RGB(base_dc.squeeze()).detach().clone()
+            mask_t = torch.from_numpy(self.manual_split_selected_point_mask.astype(np.bool_)).to(current_rgb.device)
+            color_rgb = torch.tensor(self.manual_split_selected_point_preview_color, dtype=current_rgb.dtype, device=current_rgb.device) / 255.0
+            current_rgb[mask_t] = color_rgb
+            recolor_dc = RGB2SH(current_rgb).unsqueeze(1)
+
+            self.manual_split_selected_point_preview_backup_dc = base_dc
+            self.gaussian_model._features_dc.copy_(recolor_dc)
+
+        self.update_client()
+
+    def _save_manual_split_point_assignments(self):
+        if self.prep_dir is None or self.prep_dir == "":
+            raise ValueError("--prep_dir is empty, cannot save split data")
+        if self.manual_split_point_room_ids is None:
+            raise ValueError("No point-room assignment found")
+
+        split_dir = os.path.join(self.prep_dir, "split")
+        os.makedirs(split_dir, exist_ok=True)
+
+        point_room_ids = self.manual_split_point_room_ids.astype(np.int32)
+        self.manual_split_room_point_masks = self._build_room_point_masks(point_room_ids)
+        np.save(os.path.join(split_dir, "point_room_ids.npy"), point_room_ids)
+
+        room_point_counts = {
+            str(room_id): int(mask.sum()) for room_id, mask in sorted(self.manual_split_room_point_masks.items(), key=lambda x: x[0])
+        }
+
+        summary = {
+            "num_cameras_total": int(len(self.camera_poses)),
+            "num_cameras_assigned": int(len(self.manual_split_assignments)),
+            "num_points_total": int(point_room_ids.shape[0]),
+            "num_points_assigned": int(np.count_nonzero(point_room_ids >= 0)),
+            "room_point_counts": room_point_counts,
+        }
+
+        summary_path = os.path.join(split_dir, "manual_split_summary.json")
+        if os.path.exists(summary_path):
+            with open(summary_path, "r", encoding="utf-8") as f:
+                prev_summary = json.load(f)
+            if isinstance(prev_summary, dict):
+                prev_summary.update(summary)
+                summary = prev_summary
+
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+        for room_id, mask in self.manual_split_room_point_masks.items():
+            np.save(os.path.join(split_dir, f"room_{room_id}_point_mask.npy"), mask.astype(np.uint8))
+
+        print(f"[INFO] point-room assignments saved in {split_dir}")
 
     def _refresh_manual_split_camera_colors(self):
         if not hasattr(self, "manual_split_enable"):
@@ -384,6 +584,78 @@ class Viewer:
         self._refresh_manual_split_camera_colors()
         return len(hits)
 
+    def _apply_manual_split_point_rect_select(
+        self,
+        client: viser.ClientHandle,
+        screen_pos: Tuple[Tuple[float, float], Tuple[float, float]],
+        mode: str,
+    ) -> int:
+        point_xyz = self.gaussian_model.get_xyz.detach()
+        if point_xyz.shape[0] == 0:
+            return 0
+
+        # Cache CPU xyz to reduce repeated GPU->CPU transfer during drag-select.
+        if (
+            self.manual_split_point_xyz_cache is None
+            or self.manual_split_point_xyz_cache.shape[0] != int(point_xyz.shape[0])
+        ):
+            self.manual_split_point_xyz_cache = point_xyz.detach().cpu().numpy().astype(np.float32)
+        points_np = self.manual_split_point_xyz_cache
+
+        (x0, y0), (x1, y1) = screen_pos
+        x_min, x_max = float(min(x0, x1)), float(max(x0, x1))
+        y_min, y_max = float(min(y0, y1)), float(max(y0, y1))
+
+        cam = client.camera
+        cam_pos = np.asarray(cam.position, dtype=np.float64)
+        cam_wxyz = np.asarray(cam.wxyz, dtype=np.float64)
+        cam_fov = float(cam.fov)
+        cam_aspect = float(cam.aspect)
+
+        tan_half = math.tan(cam_fov * 0.5)
+        if tan_half <= 1e-8:
+            return 0
+
+        t_camera_world = vtf.SE3.from_rotation_and_translation(
+            vtf.SO3(cam_wxyz), cam_pos
+        ).inverse()
+        mat = t_camera_world.as_matrix().astype(np.float64)
+
+        ones = np.ones((points_np.shape[0], 1), dtype=np.float64)
+        points_h = np.concatenate([points_np.astype(np.float64), ones], axis=1)
+        p_cam = (mat @ points_h.T).T[:, :3]
+
+        z = p_cam[:, 2]
+        valid = z > 1e-6
+        if not np.any(valid):
+            return 0
+
+        xy = np.zeros((p_cam.shape[0], 2), dtype=np.float64)
+        xy[valid] = p_cam[valid, :2] / z[valid, None]
+        xy /= tan_half
+        xy[:, 0] /= max(cam_aspect, 1e-8)
+        xy01 = (1.0 + xy) * 0.5
+
+        in_rect = (
+            valid
+            & (xy01[:, 0] >= x_min)
+            & (xy01[:, 0] <= x_max)
+            & (xy01[:, 1] >= y_min)
+            & (xy01[:, 1] <= y_max)
+        )
+
+        if self.manual_split_selected_point_mask is None or mode == "replace":
+            self.manual_split_selected_point_mask = in_rect.copy()
+        elif mode == "append":
+            self.manual_split_selected_point_mask |= in_rect
+        else:
+            # For point selection target, allow subtract behavior even if UI mode is extended later.
+            self.manual_split_selected_point_mask &= (~in_rect)
+
+        self._refresh_manual_split_point_selection_preview()
+
+        return int(np.count_nonzero(in_rect))
+
     def _bind_rect_select_for_client(self, client: viser.ClientHandle):
         if client.client_id in self.manual_split_rect_select_clients:
             return
@@ -397,13 +669,23 @@ class Viewer:
             if len(event.screen_pos) < 2:
                 return
 
-            hit_count = self._apply_manual_split_rect_select(
-                client=event.client,
-                screen_pos=(event.screen_pos[0], event.screen_pos[1]),
-                mode=self.manual_split_select_mode.value,
-            )
+            target = self.manual_split_drag_select_target.value if hasattr(self, "manual_split_drag_select_target") else "camera"
+            if target == "point":
+                hit_count = self._apply_manual_split_point_rect_select(
+                    client=event.client,
+                    screen_pos=(event.screen_pos[0], event.screen_pos[1]),
+                    mode=self.manual_split_select_mode.value,
+                )
+                print(f"[INFO] drag-select hit points: {hit_count}")
+            else:
+                hit_count = self._apply_manual_split_rect_select(
+                    client=event.client,
+                    screen_pos=(event.screen_pos[0], event.screen_pos[1]),
+                    mode=self.manual_split_select_mode.value,
+                )
+                print(f"[INFO] drag-select hit cameras: {hit_count}")
+
             self.manual_split_status.value = self._manual_split_status_text()
-            print(f"[INFO] drag-select hit cameras: {hit_count}")
 
         self.manual_split_rect_select_clients.add(client.client_id)
 
@@ -494,17 +776,29 @@ class Viewer:
         nearest_any_idx = torch.argmin(dist_to_camera, dim=1)
 
         visible_mat = torch.from_numpy(np.stack(visibility_masks, axis=1)).to(point_xyz.device)
-        # Room-level assignment: combine nearest visible distance with a penalty
-        # when a room has weak multi-view support for a point.
         room_ids_per_cam = np.asarray(
             [int(self.manual_split_assignments[cam_idx]) for cam_idx in assigned_camera_ids],
             dtype=np.int32,
         )
         unique_room_ids = sorted(set(room_ids_per_cam.tolist()))
 
-        room_k_nearest = 2
-        support_expected = 2.0
-        support_penalty_lambda = 0.8
+        # Combined score terms; values can be tuned from GUI.
+        room_k_nearest = max(1, int(getattr(self, "room_assign_k_nearest_slider", None).value)) \
+            if hasattr(self, "room_assign_k_nearest_slider") else max(1, int(self.room_assign_k_nearest))
+        support_expected = max(1e-3, float(getattr(self, "room_assign_support_expected_slider", None).value)) \
+            if hasattr(self, "room_assign_support_expected_slider") else max(1e-3, float(self.room_assign_support_expected))
+        support_penalty_lambda = float(getattr(self, "room_assign_support_penalty_slider", None).value) \
+            if hasattr(self, "room_assign_support_penalty_slider") else float(self.room_assign_support_penalty_lambda)
+        dist_weight = float(getattr(self, "room_assign_dist_weight_slider", None).value) \
+            if hasattr(self, "room_assign_dist_weight_slider") else float(self.room_assign_dist_weight)
+        center_weight = float(getattr(self, "room_assign_center_weight_slider", None).value) \
+            if hasattr(self, "room_assign_center_weight_slider") else float(self.room_assign_center_weight)
+        color_weight = float(getattr(self, "room_assign_color_weight_slider", None).value) \
+            if hasattr(self, "room_assign_color_weight_slider") else float(self.room_assign_color_weight)
+        support_reward_weight = float(getattr(self, "room_assign_support_reward_slider", None).value) \
+            if hasattr(self, "room_assign_support_reward_slider") else float(self.room_assign_support_reward_weight)
+        confidence_margin_threshold = float(getattr(self, "room_assign_confidence_margin_slider", None).value) \
+            if hasattr(self, "room_assign_confidence_margin_slider") else float(self.room_assign_conf_margin_threshold)
 
         num_points = point_xyz.shape[0]
         num_rooms = len(unique_room_ids)
@@ -514,6 +808,19 @@ class Viewer:
             dtype=dist_to_camera.dtype,
             device=dist_to_camera.device,
         )
+
+        # Use current SH->RGB as a weak appearance cue for room consistency.
+        point_rgb = SH2RGB(self.gaussian_model._features_dc.squeeze()).detach()
+        color_scale = torch.clamp(torch.std(point_rgb), min=1e-3)
+        flat_dist = dist_to_camera.reshape(-1)
+        max_scale_samples = 2_000_000
+        if flat_dist.numel() > max_scale_samples:
+            # Avoid quantile on huge tensors; sampled median is stable enough for normalization.
+            stride = max(1, flat_dist.numel() // max_scale_samples)
+            dist_sample = flat_dist[::stride]
+        else:
+            dist_sample = flat_dist
+        dist_scale = torch.clamp(torch.median(dist_sample), min=1e-3)
 
         inf_dist = torch.full_like(dist_to_camera, float("inf"))
         for room_local_idx, room_id in enumerate(unique_room_ids):
@@ -541,8 +848,26 @@ class Viewer:
             visible_count = room_visible.sum(dim=1).to(dist_to_camera.dtype)
             support_gap = torch.clamp((support_expected - visible_count) / support_expected, min=0.0)
             support_penalty = 1.0 + support_penalty_lambda * support_gap
+            support_reward = support_reward_weight * torch.clamp(visible_count / support_expected, max=1.0)
 
-            room_scores[:, room_local_idx] = mean_topk_dist * support_penalty
+            room_cam_centers = cam_centers_t[room_cam_mask]
+            room_center = room_cam_centers.mean(dim=0, keepdim=True)
+            center_dist = torch.linalg.norm(point_xyz - room_center, dim=1) / dist_scale
+
+            room_visible_any = room_visible.any(dim=1)
+            if bool(torch.any(room_visible_any)):
+                room_proto_rgb = point_rgb[room_visible_any].mean(dim=0, keepdim=True)
+            else:
+                room_proto_rgb = point_rgb.mean(dim=0, keepdim=True)
+            color_dist = torch.mean(torch.abs(point_rgb - room_proto_rgb), dim=1) / color_scale
+
+            dist_term = (mean_topk_dist / dist_scale) * support_penalty
+            room_scores[:, room_local_idx] = (
+                dist_weight * dist_term
+                + center_weight * center_dist
+                + color_weight * color_dist
+                - support_reward
+            )
 
         best_room_local_idx = torch.argmin(room_scores, dim=1)
         best_room_score = torch.min(room_scores, dim=1).values
@@ -556,13 +881,174 @@ class Viewer:
             fallback_room_ids,
         )
 
+        low_confidence: Optional[torch.Tensor] = None
+        confidence_margin: Optional[torch.Tensor] = None
+        if num_rooms > 1:
+            two_best = torch.topk(room_scores, k=2, dim=1, largest=False).values
+            confidence_margin = two_best[:, 1] - two_best[:, 0]
+            low_confidence = has_visible_room_support & (confidence_margin < confidence_margin_threshold)
+            chosen_room_ids = torch.where(low_confidence, fallback_room_ids, chosen_room_ids)
+            print(
+                f"[INFO] room assignment confidence fallback: low_conf={int(low_confidence.sum().item())}/{num_points}, "
+                f"margin_th={confidence_margin_threshold:.3f}"
+            )
+
+        print(
+            f"[INFO] split score params | k={room_k_nearest}, expected={support_expected:.2f}, "
+            f"penalty={support_penalty_lambda:.2f}, w_dist={dist_weight:.2f}, w_center={center_weight:.2f}, "
+            f"w_color={color_weight:.2f}, w_support={support_reward_weight:.2f}"
+        )
+
+        chosen_room_ids = self._refine_point_room_assignments_graph(
+            point_xyz=point_xyz,
+            room_scores=room_scores,
+            unique_room_ids=unique_room_ids,
+            current_assignments=chosen_room_ids,
+            low_confidence_mask=low_confidence,
+            confidence_margin=confidence_margin,
+        )
+
         point_room_ids = chosen_room_ids.detach().cpu().numpy().astype(np.int32)
 
         return point_room_ids
 
+    def _refine_point_room_assignments_graph(
+        self,
+        point_xyz: torch.Tensor,
+        room_scores: torch.Tensor,
+        unique_room_ids: List[int],
+        current_assignments: torch.Tensor,
+        low_confidence_mask: Optional[torch.Tensor] = None,
+        confidence_margin: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        enable_graph_refine = bool(getattr(self, "room_assign_graph_refine_enable_checkbox", None).value) \
+            if hasattr(self, "room_assign_graph_refine_enable_checkbox") else bool(self.room_assign_graph_refine_enable)
+        if not enable_graph_refine:
+            return current_assignments
+
+        num_points = int(point_xyz.shape[0])
+        num_rooms = len(unique_room_ids)
+        if num_points == 0 or num_rooms <= 1:
+            return current_assignments
+
+        graph_k = int(getattr(self, "room_assign_graph_knn_slider", None).value) \
+            if hasattr(self, "room_assign_graph_knn_slider") else int(self.room_assign_graph_knn)
+        smooth_lambda = float(getattr(self, "room_assign_graph_lambda_slider", None).value) \
+            if hasattr(self, "room_assign_graph_lambda_slider") else float(self.room_assign_graph_lambda)
+        sigma_x_manual = float(getattr(self, "room_assign_graph_sigma_x_slider", None).value) \
+            if hasattr(self, "room_assign_graph_sigma_x_slider") else float(self.room_assign_graph_sigma_x)
+        sigma_c = float(getattr(self, "room_assign_graph_sigma_c_slider", None).value) \
+            if hasattr(self, "room_assign_graph_sigma_c_slider") else float(self.room_assign_graph_sigma_c)
+        num_iters = int(getattr(self, "room_assign_graph_iters_slider", None).value) \
+            if hasattr(self, "room_assign_graph_iters_slider") else int(self.room_assign_graph_iters)
+        only_low_conf = bool(getattr(self, "room_assign_graph_only_low_conf_checkbox", None).value) \
+            if hasattr(self, "room_assign_graph_only_low_conf_checkbox") else bool(self.room_assign_graph_only_low_conf)
+        low_conf_margin = float(getattr(self, "room_assign_graph_low_conf_margin_slider", None).value) \
+            if hasattr(self, "room_assign_graph_low_conf_margin_slider") else float(self.room_assign_graph_low_conf_margin)
+        use_normal_consistency = bool(getattr(self, "room_assign_graph_use_normal_consistency_checkbox", None).value) \
+            if hasattr(self, "room_assign_graph_use_normal_consistency_checkbox") else bool(self.room_assign_graph_use_normal_consistency)
+        normal_weight = float(getattr(self, "room_assign_graph_normal_weight_slider", None).value) \
+            if hasattr(self, "room_assign_graph_normal_weight_slider") else float(self.room_assign_graph_normal_weight)
+
+        if smooth_lambda <= 0.0 or num_iters <= 0:
+            return current_assignments
+
+        k_eff = max(1, min(graph_k, num_points - 1))
+        if k_eff <= 0:
+            return current_assignments
+
+        _, nn_idx, nn_dist = K_nearest_neighbors(point_xyz, k_eff + 1, point_xyz, return_dist=True)
+        if nn_idx.ndim == 1:
+            nn_idx = nn_idx.unsqueeze(1)
+            nn_dist = nn_dist.unsqueeze(1)
+
+        nn_idx = nn_idx[:, 1:]
+        nn_dist = nn_dist[:, 1:]
+
+        if nn_idx.shape[1] == 0:
+            return current_assignments
+
+        if sigma_x_manual > 0:
+            sigma_x = torch.tensor(sigma_x_manual, dtype=point_xyz.dtype, device=point_xyz.device)
+        else:
+            sigma_x = torch.clamp(torch.median(nn_dist), min=1e-4)
+        sigma_c_t = torch.tensor(max(sigma_c, 1e-4), dtype=point_xyz.dtype, device=point_xyz.device)
+
+        point_rgb = SH2RGB(self.gaussian_model._features_dc.squeeze()).detach()
+        nn_rgb = point_rgb[nn_idx]
+        color_diff = torch.mean(torch.abs(point_rgb[:, None, :] - nn_rgb), dim=2)
+
+        w_x = torch.exp(-0.5 * (nn_dist / sigma_x) ** 2)
+        w_c = torch.exp(-(color_diff / sigma_c_t))
+        pair_w = w_x * w_c
+
+        if use_normal_consistency and nn_idx.shape[1] >= 2 and normal_weight > 0.0:
+            # Fast local normal approximation from two nearest neighbor directions.
+            p0 = point_xyz
+            p1 = point_xyz[nn_idx[:, 0]]
+            p2 = point_xyz[nn_idx[:, 1]]
+            v1 = p1 - p0
+            v2 = p2 - p0
+            n = torch.cross(v1, v2, dim=1)
+            n = torch.nn.functional.normalize(n, dim=1, eps=1e-6)
+
+            nn_n = n[nn_idx]
+            cos_sim = torch.sum(n[:, None, :] * nn_n, dim=2).abs().clamp(0.0, 1.0)
+            w_n = torch.exp(-normal_weight * (1.0 - cos_sim))
+            pair_w = pair_w * w_n
+
+        unary = torch.nan_to_num(room_scores.detach(), nan=1e6, posinf=1e6, neginf=0.0)
+        room_ids_t = torch.tensor(unique_room_ids, dtype=current_assignments.dtype, device=current_assignments.device)
+
+        labels = current_assignments.clone()
+        target_mask = torch.ones((num_points,), dtype=torch.bool, device=labels.device)
+        if only_low_conf:
+            if low_confidence_mask is not None:
+                target_mask = low_confidence_mask.to(labels.device)
+            elif confidence_margin is not None:
+                target_mask = confidence_margin.to(labels.device) < low_conf_margin
+            else:
+                two_best = torch.topk(unary, k=min(2, unary.shape[1]), dim=1, largest=False).values
+                if two_best.shape[1] == 2:
+                    target_mask = (two_best[:, 1] - two_best[:, 0]) < low_conf_margin
+                else:
+                    target_mask = torch.zeros((num_points,), dtype=torch.bool, device=labels.device)
+
+            if not bool(torch.any(target_mask)):
+                print("[INFO] graph refine skipped: no low-confidence points")
+                return labels
+
+        for _ in range(num_iters):
+            smooth_cost = torch.zeros_like(unary)
+            for ridx in range(num_rooms):
+                room_id = room_ids_t[ridx]
+                same_label = (labels[nn_idx] == room_id).to(pair_w.dtype)
+                smooth_cost[:, ridx] = torch.sum(pair_w * (1.0 - same_label), dim=1)
+
+            total_cost = unary + smooth_lambda * smooth_cost
+            new_local = torch.argmin(total_cost, dim=1)
+            new_labels = room_ids_t[new_local]
+            if only_low_conf:
+                new_labels = torch.where(target_mask, new_labels, labels)
+
+            changed = int((new_labels != labels).sum().item())
+            labels = new_labels
+            if changed == 0:
+                break
+
+        print(
+            f"[INFO] graph refine | k={k_eff}, lambda={smooth_lambda:.3f}, "
+            f"sigma_x={float(sigma_x.item()):.4f}, sigma_c={float(sigma_c_t.item()):.4f}, iters={num_iters}, "
+            f"only_low_conf={only_low_conf}, low_conf_points={int(target_mask.sum().item())}/{num_points}, "
+            f"normal_consistency={use_normal_consistency}, normal_w={normal_weight:.3f}"
+        )
+        return labels
+
     def _build_room_point_masks(self, point_room_ids: np.ndarray) -> Dict[int, np.ndarray]:
         room_masks: Dict[int, np.ndarray] = {}
-        unique_room_ids = sorted(set([int(v) for v in self.manual_split_assignments.values()]))
+        unique_room_ids = sorted(set([int(v) for v in point_room_ids.tolist() if int(v) >= 0]))
+        if len(unique_room_ids) == 0:
+            unique_room_ids = sorted(set([int(v) for v in self.manual_split_assignments.values()]))
         for room_id in unique_room_ids:
             room_masks[room_id] = (point_room_ids == room_id)
         return room_masks
@@ -579,7 +1065,10 @@ class Viewer:
         with torch.no_grad():
             current_rgb = SH2RGB(self.gaussian_model._features_dc.squeeze()).detach().clone()
             room_ids = torch.from_numpy(self.manual_split_point_room_ids).to(current_rgb.device)
-            for room_id in sorted(set([int(v) for v in self.manual_split_assignments.values()])):
+            point_rooms = sorted(set([int(v) for v in self.manual_split_point_room_ids.tolist() if int(v) >= 0]))
+            if len(point_rooms) == 0:
+                point_rooms = sorted(set([int(v) for v in self.manual_split_assignments.values()]))
+            for room_id in point_rooms:
                 mask = room_ids == int(room_id)
                 color = torch.tensor(self._room_color(int(room_id)), dtype=current_rgb.dtype, device=current_rgb.device) / 255.0
                 current_rgb[mask] = color
@@ -591,6 +1080,8 @@ class Viewer:
         print("[INFO] colorized points by room assignment")
 
     def _restore_point_colors_after_room_visualization(self):
+        self._clear_manual_split_point_selection_preview()
+
         if self.manual_split_color_backup_dc is None:
             print("[INFO] no backup color to restore")
             return
@@ -602,6 +1093,7 @@ class Viewer:
         self.manual_split_color_backup_dc = None
         self.manual_split_color_backup_rest = None
         self.update_client()
+        self._refresh_manual_split_point_selection_preview()
         print("[INFO] restored original point colors")
 
     def _save_manual_split_data(self):
@@ -667,6 +1159,7 @@ class Viewer:
             if 0 <= int(k) < len(self.camera_poses)
         }
         self.manual_split_selected_ids = set()
+        self.manual_split_selected_point_mask = None
 
         point_room_path = os.path.join(split_dir, "point_room_ids.npy")
         if os.path.exists(point_room_path):
@@ -2545,6 +3038,10 @@ class Viewer:
                     "Enable Drag Rect Select",
                     initial_value=False,
                 )
+                self.manual_split_drag_select_target = server.add_gui_button_group(
+                    "Drag Select Target",
+                    ("camera", "point"),
+                )
                 self.manual_split_preview_mode = server.add_gui_button_group(
                     "Split Preview Render",
                     ("gaussian", "pointcloud"),
@@ -2565,9 +3062,143 @@ class Viewer:
                 self.manual_split_apply_button = server.add_gui_button("Apply Split And Save")
                 self.manual_split_colorize_points_button = server.add_gui_button("Colorize Assigned Points")
                 self.manual_split_restore_points_color_button = server.add_gui_button("Restore Point Colors")
+                self.manual_split_point_select_mode = server.add_gui_button_group(
+                    "Point Select Mode",
+                    ("replace", "append", "subtract"),
+                )
+                self.manual_split_select_points_button = server.add_gui_button("Select Points From Selected Cameras")
+                self.manual_split_assign_points_button = server.add_gui_button("Assign Selected Points To Current Room")
+                self.manual_split_unassign_points_button = server.add_gui_button("Unassign Selected Points")
+                self.manual_split_clear_point_selection_button = server.add_gui_button("Clear Point Selection")
+                self.manual_split_save_point_assignments_button = server.add_gui_button("Save Point Assignments")
+                self.manual_split_preview_selected_points = server.add_gui_checkbox(
+                    "Preview Selected Points",
+                    initial_value=True,
+                )
+                self.manual_split_preview_selected_points_color = server.add_gui_rgb(
+                    "Selected Point Color",
+                    initial_value=self.manual_split_selected_point_preview_color,
+                )
                 self.manual_split_status = server.add_gui_text(
                     "Split Status",
                     initial_value="Manual split disabled.",
+                )
+                self.room_assign_k_nearest_slider = server.add_gui_slider(
+                    "Score K Nearest",
+                    min=1,
+                    max=8,
+                    step=1,
+                    initial_value=self.room_assign_k_nearest,
+                )
+                self.room_assign_support_expected_slider = server.add_gui_slider(
+                    "Score Support Expected",
+                    min=1.0,
+                    max=6.0,
+                    step=0.1,
+                    initial_value=self.room_assign_support_expected,
+                )
+                self.room_assign_support_penalty_slider = server.add_gui_slider(
+                    "Score Support Penalty",
+                    min=0.0,
+                    max=3.0,
+                    step=0.05,
+                    initial_value=self.room_assign_support_penalty_lambda,
+                )
+                self.room_assign_dist_weight_slider = server.add_gui_slider(
+                    "Weight Distance",
+                    min=0.0,
+                    max=3.0,
+                    step=0.05,
+                    initial_value=self.room_assign_dist_weight,
+                )
+                self.room_assign_center_weight_slider = server.add_gui_slider(
+                    "Weight Room Center",
+                    min=0.0,
+                    max=2.0,
+                    step=0.05,
+                    initial_value=self.room_assign_center_weight,
+                )
+                self.room_assign_color_weight_slider = server.add_gui_slider(
+                    "Weight Color",
+                    min=0.0,
+                    max=2.0,
+                    step=0.05,
+                    initial_value=self.room_assign_color_weight,
+                )
+                self.room_assign_support_reward_slider = server.add_gui_slider(
+                    "Weight Support Reward",
+                    min=0.0,
+                    max=1.0,
+                    step=0.02,
+                    initial_value=self.room_assign_support_reward_weight,
+                )
+                self.room_assign_confidence_margin_slider = server.add_gui_slider(
+                    "Confidence Margin Fallback",
+                    min=0.0,
+                    max=0.5,
+                    step=0.01,
+                    initial_value=self.room_assign_conf_margin_threshold,
+                )
+                self.room_assign_graph_refine_enable_checkbox = server.add_gui_checkbox(
+                    "Enable Graph Refine",
+                    initial_value=self.room_assign_graph_refine_enable,
+                )
+                self.room_assign_graph_knn_slider = server.add_gui_slider(
+                    "Graph KNN",
+                    min=2,
+                    max=32,
+                    step=1,
+                    initial_value=self.room_assign_graph_knn,
+                )
+                self.room_assign_graph_lambda_slider = server.add_gui_slider(
+                    "Graph Smooth Lambda",
+                    min=0.0,
+                    max=2.0,
+                    step=0.02,
+                    initial_value=self.room_assign_graph_lambda,
+                )
+                self.room_assign_graph_sigma_x_slider = server.add_gui_slider(
+                    "Graph Sigma X (0=auto)",
+                    min=0.0,
+                    max=2.0,
+                    step=0.01,
+                    initial_value=self.room_assign_graph_sigma_x,
+                )
+                self.room_assign_graph_sigma_c_slider = server.add_gui_slider(
+                    "Graph Sigma Color",
+                    min=0.01,
+                    max=1.0,
+                    step=0.01,
+                    initial_value=self.room_assign_graph_sigma_c,
+                )
+                self.room_assign_graph_iters_slider = server.add_gui_slider(
+                    "Graph Iterations",
+                    min=1,
+                    max=20,
+                    step=1,
+                    initial_value=self.room_assign_graph_iters,
+                )
+                self.room_assign_graph_only_low_conf_checkbox = server.add_gui_checkbox(
+                    "Graph Refine Only Low-Conf",
+                    initial_value=self.room_assign_graph_only_low_conf,
+                )
+                self.room_assign_graph_low_conf_margin_slider = server.add_gui_slider(
+                    "Graph Low-Conf Margin",
+                    min=0.01,
+                    max=0.5,
+                    step=0.01,
+                    initial_value=self.room_assign_graph_low_conf_margin,
+                )
+                self.room_assign_graph_use_normal_consistency_checkbox = server.add_gui_checkbox(
+                    "Graph Use Normal Consistency",
+                    initial_value=self.room_assign_graph_use_normal_consistency,
+                )
+                self.room_assign_graph_normal_weight_slider = server.add_gui_slider(
+                    "Graph Normal Weight",
+                    min=0.0,
+                    max=3.0,
+                    step=0.05,
+                    initial_value=self.room_assign_graph_normal_weight,
                 )
 
             with server.add_gui_folder("Render Options"):
@@ -2749,6 +3380,17 @@ class Viewer:
                 self._update_rect_select_bindings(server)
                 self.manual_split_status.value = self._manual_split_status_text()
 
+            @self.manual_split_preview_selected_points.on_update
+            def _(_event):
+                self._refresh_manual_split_point_selection_preview()
+                self.manual_split_status.value = self._manual_split_status_text()
+
+            @self.manual_split_preview_selected_points_color.on_update
+            def _(_event):
+                self.manual_split_selected_point_preview_color = tuple(self.manual_split_preview_selected_points_color.value)
+                self._refresh_manual_split_point_selection_preview()
+                self.manual_split_status.value = self._manual_split_status_text()
+
             @self.manual_split_preview_mode.on_click
             def _(_event):
                 if self.manual_split_preview_mode.value == "pointcloud":
@@ -2762,6 +3404,12 @@ class Viewer:
             def _(_event):
                 self.manual_split_selected_ids.clear()
                 self._refresh_manual_split_camera_colors()
+                self.manual_split_status.value = self._manual_split_status_text()
+
+            @self.manual_split_clear_point_selection_button.on_click
+            def _(_event):
+                self.manual_split_selected_point_mask = None
+                self._refresh_manual_split_point_selection_preview()
                 self.manual_split_status.value = self._manual_split_status_text()
 
             @self.manual_split_assign_button.on_click
@@ -2822,12 +3470,29 @@ class Viewer:
 
             @self.manual_split_apply_button.on_click
             def _(_event):
-                try:
-                    self._save_manual_split_data()
-                    self._colorize_points_by_room()
-                    self.manual_split_status.value = self._manual_split_status_text()
-                except Exception as err:
-                    print(f"[WARN] split apply failed: {err}")
+                if self.manual_split_is_applying:
+                    self.manual_split_status.value = "Split is already running, please wait..."
+                    print("[INFO] split apply is already running")
+                    return
+
+                self.manual_split_is_applying = True
+                start_t = time.time()
+                self.manual_split_status.value = "Applying split and saving..."
+
+                def _run_apply_split_job():
+                    try:
+                        self._save_manual_split_data()
+                        self._colorize_points_by_room()
+                        elapsed = time.time() - start_t
+                        status = self._manual_split_status_text()
+                        self.manual_split_status.value = f"{status} | Split saved in {elapsed:.2f}s"
+                    except Exception as err:
+                        self.manual_split_status.value = f"Split apply failed: {err}"
+                        print(f"[WARN] split apply failed: {err}")
+                    finally:
+                        self.manual_split_is_applying = False
+
+                threading.Thread(target=_run_apply_split_job, daemon=True).start()
 
             @self.manual_split_colorize_points_button.on_click
             def _(_event):
@@ -2836,6 +3501,55 @@ class Viewer:
             @self.manual_split_restore_points_color_button.on_click
             def _(_event):
                 self._restore_point_colors_after_room_visualization()
+
+            @self.manual_split_select_points_button.on_click
+            def _(_event):
+                try:
+                    self.manual_split_status.value = "Selecting points from selected cameras..."
+                    hit_count = self._manual_split_select_points_from_selected_cameras(
+                        mode=self.manual_split_point_select_mode.value,
+                    )
+                    self.manual_split_status.value = self._manual_split_status_text()
+                    print(f"[INFO] selected points by cameras: {hit_count}")
+                except Exception as err:
+                    self.manual_split_status.value = f"Point selection failed: {err}"
+                    print(f"[WARN] point selection failed: {err}")
+
+            @self.manual_split_assign_points_button.on_click
+            def _(_event):
+                try:
+                    room_id = int(self.manual_split_room_id.value)
+                    changed = self._manual_split_assign_selected_points_to_room(room_id)
+                    self._clear_manual_split_point_selection_preview()
+                    self._colorize_points_by_room()
+                    self._refresh_manual_split_point_selection_preview()
+                    self.manual_split_status.value = self._manual_split_status_text()
+                    print(f"[INFO] assigned selected points to room_{room_id}: {changed}")
+                except Exception as err:
+                    self.manual_split_status.value = f"Point assign failed: {err}"
+                    print(f"[WARN] point assign failed: {err}")
+
+            @self.manual_split_unassign_points_button.on_click
+            def _(_event):
+                try:
+                    changed = self._manual_split_unassign_selected_points()
+                    self._clear_manual_split_point_selection_preview()
+                    self._colorize_points_by_room()
+                    self._refresh_manual_split_point_selection_preview()
+                    self.manual_split_status.value = self._manual_split_status_text()
+                    print(f"[INFO] unassigned selected points: {changed}")
+                except Exception as err:
+                    self.manual_split_status.value = f"Point unassign failed: {err}"
+                    print(f"[WARN] point unassign failed: {err}")
+
+            @self.manual_split_save_point_assignments_button.on_click
+            def _(_event):
+                try:
+                    self._save_manual_split_point_assignments()
+                    self.manual_split_status.value = self._manual_split_status_text() + " | Point assignments saved"
+                except Exception as err:
+                    self.manual_split_status.value = f"Save point assignments failed: {err}"
+                    print(f"[WARN] save point assignments failed: {err}")
 
             @server.on_client_connect
             def _(client: viser.ClientHandle) -> None:

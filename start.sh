@@ -32,5 +32,5 @@ python -u viewer_big_room.py \
 -s /nas1/hyh22/backup/PanoGS/data_big_room_d918a_2dgs/ \
 --cameras_json /nas1/hyh22/backup/PanoGS/data_big_room_d918a_2dgs/output/cameras.json \
 --style_img /nas1/hyh22/backup/PanoGS/style_data/indoor/room3.jpg \
---prep_dir preprocess/manual_d918a_big_room_cnn_room3_tvloss0.1_mpointcloud \
+--prep_dir preprocess/manual_d918a_big_room_cnn_room3_tvloss0.1_mutiplefactor \
 --port 8092
