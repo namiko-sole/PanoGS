@@ -26,11 +26,11 @@ python -u viewer.py \
 --prep_dir preprocess/manual_d918a_r5_cnn_room3_adaptive_mini_tvloss1e-3_pretrain100_strength0.5_nodynamic \
 --port 8060
 
-CUDA_VISIBLE_DEVICES=5 \
+CUDA_VISIBLE_DEVICES=3 \
 python -u viewer_big_room.py \
 /nas1/hyh22/backup/PanoGS/data_big_room_d918a_2dgs/output/point_cloud/iteration_30000/point_cloud.ply \
 -s /nas1/hyh22/backup/PanoGS/data_big_room_d918a_2dgs/ \
 --cameras_json /nas1/hyh22/backup/PanoGS/data_big_room_d918a_2dgs/output/cameras.json \
 --style_img /nas1/hyh22/backup/PanoGS/style_data/indoor/room3.jpg \
---prep_dir preprocess/manual_d918a_big_room_cnn_room3_tvloss0.1_mutiplefactor \
---port 8092
+--prep_dir preprocess/manual_d918a_big_room_cnn_room3_tvloss0.1_mutiplefactor_cameraseq \
+--port 8093

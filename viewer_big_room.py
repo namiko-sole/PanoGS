@@ -168,6 +168,8 @@ class Viewer:
         self.manual_split_color_backup_dc: Optional[torch.Tensor] = None
         self.manual_split_color_backup_rest: Optional[torch.Tensor] = None
         self.manual_split_is_applying: bool = False
+        self.preprocess_test_room_groups: Dict[int, List[int]] = {}
+        self.preprocess_test_selected_cam_ids: List[int] = []
 
         # Tunable weights for point-room assignment after manual camera split.
         self.room_assign_k_nearest: int = 2
@@ -1211,6 +1213,7 @@ class Viewer:
             @camera_handle.on_click
             def _(event: viser.SceneNodePointerEvent[viser.CameraFrustumHandle], camera_idx=idx) -> None:
                 if hasattr(self, "manual_split_enable") and self.manual_split_enable.value:
+                    print(f"Clicked camera idx: {camera_idx}")
                     if camera_idx in self.manual_split_selected_ids:
                         self.manual_split_selected_ids.remove(camera_idx)
                     else:
@@ -1219,6 +1222,10 @@ class Viewer:
                     if hasattr(self, "manual_split_status"):
                         self.manual_split_status.value = self._manual_split_status_text()
                     return
+
+                if hasattr(self, "training_view_slider"):
+                    target_idx = int(max(0, min(camera_idx, self.training_view_slider.max)))
+                    self.training_view_slider.value = target_idx
 
                 with event.client.atomic():
                     event.client.camera.position = event.target.position
@@ -1666,9 +1673,6 @@ class Viewer:
         gap_threshold, camera_distance_stats = get_gap_threshold()
         self.last_preprocess_camera_distance_stats = camera_distance_stats
         cam_id = list(range(len(self.colmap_cameras)))
-        
-        if self.sort_camera_center.value:
-            cam_id = sorted(cam_id, key=lambda idx: np.linalg.norm(self.camera_poses[idx]["position"]))
 
         # center_cam = np.array([0, 0, 0])[None]
         if len(self.camera_poses) > 0:
@@ -1731,11 +1735,29 @@ class Viewer:
                         f"[INFO] candidate cameras without manual room assignment are skipped: "
                         f"count={len(unassigned_candidate_ids)}"
                     )
+                
+                if getattr(self.sort_camera_center, "value", False):
+                    for room_id, cam_ids in room_groups.items():
+                        centers = np.array([self.camera_poses[idx]["position"] for idx in cam_ids], dtype=np.float32)
+                        mean_center = centers.mean(axis=0)
+                        room_groups[room_id] = sorted(cam_ids, key=lambda idx: float(np.linalg.norm(np.array(self.camera_poses[idx]["position"], dtype=np.float32) - mean_center)))
+
                 return room_groups, "auto_candidate_manual_split_grouped"
 
             print("[WARN] no candidate cameras matched manual split assignments, fallback to auto candidates")
 
-        return {-1: candidate_cam_ids}, "auto_candidate"
+        room_groups = {-1: candidate_cam_ids}
+        if getattr(self.sort_camera_center, "value", False):
+            for room_id, cam_ids in room_groups.items():
+                valid_cam_ids = [idx for idx in cam_ids if idx >= 0]
+                if len(valid_cam_ids) > 0:
+                    centers = np.array([self.camera_poses[idx]["position"] for idx in valid_cam_ids], dtype=np.float32)
+                    mean_center = centers.mean(axis=0)
+                    sorted_valid = sorted(valid_cam_ids, key=lambda idx: float(np.linalg.norm(np.array(self.camera_poses[idx]["position"], dtype=np.float32) - mean_center)))
+                    invalid_cam_ids = [idx for idx in cam_ids if idx < 0]
+                    room_groups[room_id] = invalid_cam_ids + sorted_valid
+
+        return room_groups, "auto_candidate"
 
     def color_update_style_bak(self):
         raw_rgbs = (SH2RGB(self.gaussian_model._features_dc.squeeze()).detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
@@ -3011,6 +3033,7 @@ class Viewer:
                 ) 
 
                 self.preprocess_test_button = server.add_gui_button("Preprocess Test")
+                self.highlight_preprocess_test_button = server.add_gui_button("Highlight Preprocess Cameras")
 
                 self.preprocess_stylization_button = server.add_gui_button("Preprocess Stylization")
                 self.clear_prep_cache_button = server.add_gui_button("Clear Preprocess Cache")
@@ -3700,6 +3723,17 @@ class Viewer:
                 # return
                 print(len(self.camera_poses))
                 room_groups, camera_id_source = self._resolve_preprocess_room_groups(prefer_manual_split=True)
+                self.preprocess_test_room_groups = {
+                    int(room_id): [int(cam_idx) for cam_idx in cam_id]
+                    for room_id, cam_id in room_groups.items()
+                }
+                selected_cam_ids: Set[int] = set()
+                for cam_id in self.preprocess_test_room_groups.values():
+                    for cam_idx in cam_id:
+                        if 0 <= cam_idx < len(self.camera_poses):
+                            selected_cam_ids.add(cam_idx)
+                self.preprocess_test_selected_cam_ids = sorted(selected_cam_ids)
+
                 print(f"[INFO] preprocess_test camera id source: {camera_id_source}")
                 for room_id, cam_id in sorted(room_groups.items(), key=lambda x: x[0]):
                     room_label = "all" if room_id == -1 else f"room_{room_id}"
@@ -3723,6 +3757,20 @@ class Viewer:
                             save_file_path = os.path.join(room_render_dir, f'pano_img_cam{id}.png')
                             Image.fromarray(image.astype(np.uint8)).save(save_file_path)
                             print(f"Save in {save_file_path}")
+
+            @self.highlight_preprocess_test_button.on_click
+            def _(_):
+                if len(self.preprocess_test_selected_cam_ids) == 0:
+                    print("[INFO] preprocess_test results empty, run 'Preprocess Test' first")
+                    return
+                self.manual_split_selected_ids = set(self.preprocess_test_selected_cam_ids)
+                self._refresh_manual_split_camera_colors()
+                if hasattr(self, "manual_split_status"):
+                    self.manual_split_status.value = self._manual_split_status_text()
+                print(
+                    f"[INFO] highlighted preprocess_test cameras: {len(self.preprocess_test_selected_cam_ids)} | "
+                    f"List: {self.preprocess_test_selected_cam_ids}"
+                )
 
             @self.preprocess_stylization_button.on_click
             def _(_):
