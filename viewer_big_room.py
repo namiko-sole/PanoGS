@@ -2804,6 +2804,7 @@ class Viewer:
                 styled_img_path=os.path.join(save_dir, f"cam_{idx}", "styled", "pano_styled_refined.png"),
                 depth_path=os.path.join(save_dir, f"cam_{idx}", "pano_depth.npy"),
                 point_mask=cam_mask,
+                # point_mask=cam_point_mask,
                 upscale=4,
                 color_gaussian=True,
                 room_scope_mask=room_scope_mask,
@@ -2990,7 +2991,7 @@ class Viewer:
                 self.camera_gap_slider = server.add_gui_slider(
                     "Camera Gap",
                     min=0,
-                    max=10,
+                    max=20,
                     step=1,
                     initial_value=3,
                 )
