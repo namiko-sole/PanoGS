@@ -18,7 +18,7 @@
 
 
 CUDA_VISIBLE_DEVICES=6 \
-python -u viewer.py \
+python -u viewer_fast_optimize.py \
 /nas1/hyh22/backup/PanoGS/data_2dgs/output/dl3dv_8cb2e/point_cloud/iteration_30000/point_cloud.ply \
 -s /nas1/hyh22/backup/PanoGS/data_3dgs/DL3DV-10K-Benchmark/8cb2e97d26a639f05a571476240a8fa86988e6853f0f13cc05830d1578002aad/gaussian_splat_lowres \
 --cameras_json /nas1/hyh22/backup/PanoGS/data_2dgs/output/dl3dv_8cb2e/cameras.json \

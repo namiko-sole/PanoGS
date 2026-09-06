@@ -25,3 +25,5 @@ temp*
 *.bak
 *.pth
 *.ckpt
+
+test_*/
