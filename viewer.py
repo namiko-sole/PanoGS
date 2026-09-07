@@ -51,7 +51,6 @@ from arguments import (
 from omegaconf import OmegaConf
 from scene.cameras import Simple_Camera
 from scene import Scene
-from sdwebui_api import inpaint
 from internal.utils.perceptual import PerceptualLoss
 from diffusers_inference import generate_image
 
@@ -220,6 +219,33 @@ class Viewer:
     def get_gpu_memory_usage(self):
         total_memory = torch.cuda.memory_allocated() + torch.cuda.memory_reserved() 
         return f"{total_memory / 1024 ** 2:.1f} / {self.total_device_memory:.1f} MB"
+
+    def _record_pano_timing(self, timings):
+        if not hasattr(self, "pano_timing_stats"):
+            self.pano_timing_stats = {}
+        for name, elapsed in timings.items():
+            stats = self.pano_timing_stats.setdefault(
+                name,
+                {"count": 0, "total": 0.0, "min": float("inf"), "max": 0.0},
+            )
+            elapsed = float(elapsed)
+            stats["count"] += 1
+            stats["total"] += elapsed
+            stats["min"] = min(stats["min"], elapsed)
+            stats["max"] = max(stats["max"], elapsed)
+
+    def _print_pano_timing_summary(self, timings):
+        self._record_pano_timing(timings)
+        print("[PANORAMA TIMING] current:")
+        for name, elapsed in timings.items():
+            print(f"  {name}: {elapsed:.4f}s")
+        print("[PANORAMA TIMING] cumulative min/max/total/avg:")
+        for name, stats in self.pano_timing_stats.items():
+            avg = stats["total"] / max(stats["count"], 1)
+            print(
+                f"  {name}: min={stats['min']:.4f}s max={stats['max']:.4f}s "
+                f"total={stats['total']:.4f}s avg={avg:.4f}s n={stats['count']}"
+            )
 
     def add_cameras_to_scene(self, viser_server):
         if len(self.camera_poses) == 0:
@@ -442,6 +468,9 @@ class Viewer:
         return results
     
     def render_panorama(self, camera_center, res=1024, camera_rotation=np.diag(np.ones((3))), save_dir=None, render_perspetive=False, verbose=True, mask=None):
+        total_start_time = time.perf_counter()
+        stage_start_time = total_start_time
+        timings = {}
         if verbose: print(f"generate panorama center in {camera_center}...")
         # image_height = 1024
         # image_width = 1024
@@ -502,56 +531,79 @@ class Viewer:
             # 'override_color': SH2RGB(self.gaussian_model._features_dc.squeeze()),
             'override_color': override_color,
         }
+        timings['prepare_cameras_params'] = time.perf_counter() - stage_start_time
 
+        stage_start_time = time.perf_counter()
         with torch.no_grad():
             results = [self.viewer_renderer.render_viewer(cam,
                 **render_params,
             ) for cam in cams]
+        torch.cuda.synchronize()
+        timings['render_faces'] = time.perf_counter() - stage_start_time
         
         pano_images = []
         pano_depthes = []
         # pano_depthes_distorted = []
 
+        stage_start_time = time.perf_counter()
         depth_distort = get_depth_distort(res=res).to(results[0]['surf_depth'].device) * math.radians(90) #* 2
         # depth_distort = torch.zeros((1024,1024))
 
         if render_perspetive:
+            stage_start_time = time.perf_counter()
             # for idx, result in enumerate(results):
                 # pano_images.append(result['render'])
             pano_images = torch.cat([r['render'].unsqueeze(0) for r in results], dim=0)
+            timings['perspective_pack'] = time.perf_counter() - stage_start_time
+            stage_start_time = time.perf_counter()
             if save_dir:
                 for ridx, r in enumerate(results):
                     pimg = Image.fromarray((r['render'].clip(0,1).permute(1,2,0).detach().cpu().numpy()*255).astype(np.uint8))
                     pimg.save(os.path.join(save_dir, f'perspective_img{ridx}.png'))
+            timings['save_outputs'] = time.perf_counter() - stage_start_time
+            timings['total'] = time.perf_counter() - total_start_time
+            self._print_pano_timing_summary(timings)
             return pano_images
         else:
             for idx, result in enumerate(results):
                 # result['render'] = self.
 
                 # Image.fromarray((result['render'].clip(0,1).permute(1, 2, 0).detach().cpu().numpy()*255).astype(np.uint8)).save(f"temp{idx}.png")
-                pano_images.append((result['render'].clip(0,1).permute(1, 2, 0).detach().cpu().numpy()*255).astype(np.uint8))
+                pano_image_face = (result['render'].clip(0,1).permute(1, 2, 0).detach().cpu().numpy()*255).astype(np.uint8)
+                pano_depth_face = (result['surf_depth'][0,:,:,0]+depth_distort)[...,None].detach().cpu().numpy()
+                pano_images.append(pano_image_face)
                 # pano_depthes.append(np.repeat(result['surf_depth'][0].detach().cpu().numpy(), 3, axis=-1))
                 # pano_depthes.append((result['surf_depth'][0,:,:,0])[...,None].repeat(1,1,3).detach().cpu().numpy())
                 # pano_alphas.append(result['surf_mask'][0].detach().cpu().numpy())
                 # pano_depthes.append((result['surf_depth']+result['rend_dist'])[0,:,:,0][...,None].repeat(1,1,3).detach().cpu().numpy())
-                pano_depthes.append((result['surf_depth'][0,:,:,0]+depth_distort)[...,None].repeat(1,1,3).detach().cpu().numpy())
+                pano_depthes.append(np.repeat(pano_depth_face, 3, axis=-1))
                 # pano_depthes_distorted.append((result['surf_depth'][0,:,:,0]+depth_distort)[...,None].repeat(1,1,3).detach().cpu().numpy())
+            timings['face_postprocess'] = time.perf_counter() - stage_start_time
         
-            ee_image = m_P2E.Perspective(pano_images, pers_params)
-            ee_depth = m_P2E.Perspective(pano_depthes, pers_params)
+            stage_start_time = time.perf_counter()
+            pano_image_depthes = [np.concatenate((image.astype(np.float32), depth[..., :1]), axis=-1) for image, depth in zip(pano_images, pano_depthes)]
+            ee_image_depth = m_P2E.Perspective(pano_image_depthes, pers_params)
+            timings['pack_image_depth_faces'] = time.perf_counter() - stage_start_time
             # ee_depth_distorted = m_P2E.Perspective(pano_depthes_distorted, pers_params)
             # ee_distort = m_P2E.Perspective(pano_distortes, pers_params)
 
-            print("generating panorama image...")
-            pano_image = ee_image.GetEquirec(res, res*2)
-            print("generating panorama depth...")
-            pano_depth = ee_depth.GetEquirec(res, res*2)
+            print("generating panorama image/depth...")
+            stage_start_time = time.perf_counter()
+            pano_image_depth = ee_image_depth.GetEquirec(res, res*2)
+            timings['stitch_image_depth'] = time.perf_counter() - stage_start_time
+            timings.update(getattr(ee_image_depth, 'last_timing', {}))
+
+            stage_start_time = time.perf_counter()
+            pano_image = pano_image_depth[..., :3]
+            pano_depth = np.repeat(pano_image_depth[..., 3:4], 3, axis=-1)
+            timings['split_image_depth'] = time.perf_counter() - stage_start_time
             # pano_depth_distorted = ee_depth_distorted.GetEquirec(1024, 2048)
             # print("generating panorama distort...")
             # pano_distort = ee_distort.GetEquirec(1024, 2048)
 
             # pano_depth = pano_depth + pano_distort
 
+            stage_start_time = time.perf_counter()
             if save_dir:
                 print(f"saving into {save_dir}")
                 os.makedirs(save_dir, exist_ok=True)
@@ -567,6 +619,9 @@ class Viewer:
                 np.save(os.path.join(save_dir, 'pano_pimages.npy'), pano_images)
                 np.save(os.path.join(save_dir, 'pano_pdepthes.npy'), pano_depthes)
                 # np.save(os.path.join(save_dir, 'pano_palpha.npy'), pano_alphas)
+            timings['save_outputs'] = time.perf_counter() - stage_start_time
+            timings['total'] = time.perf_counter() - total_start_time
+            self._print_pano_timing_summary(timings)
             return pano_image, pano_depth
     
     def get_pano_depth_distort(self):
@@ -953,13 +1008,8 @@ class Viewer:
 
         point_mask = np.load(point_mask_path).astype(np.bool_)
 
-        # point_centers = self.gaussian_model.get_xyz
-        # _, nn_idx = K_nearest_neighbors(point_centers[point_mask], 5, point_centers[~point_mask])
-        # nn_feat_dc = self.gaussian_model._features_dc[point_mask][nn_idx]
-        # nn_feat_rest = self.gaussian_model._features_rest[point_mask][nn_idx]
-        
-        point_color = self.raw_features_dc[:,0,:]
-        _, nn_idx = K_nearest_neighbors(point_color[point_mask], self.knn_number.value, point_color[~point_mask])
+        point_centers = self.gaussian_model.get_xyz
+        _, nn_idx = K_nearest_neighbors(point_centers[point_mask], self.knn_number.value, point_centers[~point_mask])
         nn_feat_dc = self.gaussian_model._features_dc[point_mask][nn_idx]
         nn_feat_rest = self.gaussian_model._features_rest[point_mask][nn_idx]
 
@@ -1256,7 +1306,9 @@ class Viewer:
                 self.gaussian_model.optimizer.step()
                 self.gaussian_model.optimizer.zero_grad(set_to_none=True)
         
-        def train_pano(styled_imgs, feat_dc, feat_rest, steps, random_flag=False):
+        def train_pano(styled_imgs, feat_dc, feat_rest, steps, random_flag=False, train_res=None, num_sample_views=6):
+            if train_res is None:
+                train_res = res
             def calculate_total_variation_loss(x, p=1):
                 batch_size = x.size(0)
         
@@ -1345,8 +1397,8 @@ class Viewer:
             # point_centers = self.gaussian_model.get_xyz
             # _, nn_idx = K_nearest_neighbors(point_centers[all_point_mask], 5, point_centers[~all_point_mask])
 
-            point_color = self.raw_features_dc[:,0,:]
-            _, nn_idx = K_nearest_neighbors(point_color[all_point_mask], self.knn_number.value, point_color[~all_point_mask])
+            point_centers = self.gaussian_model.get_xyz
+            _, nn_idx = K_nearest_neighbors(point_centers[all_point_mask], self.knn_number.value, point_centers[~all_point_mask])
 
             # nn_feat_dc = self.gaussian_model._features_dc[point_mask][nn_idx]
             # nn_feat_rest = self.gaussian_model._features_rest[point_mask][nn_idx]
@@ -1384,21 +1436,26 @@ class Viewer:
                 camera_center, camera_rotation, equ_styled, equ_mask = \
                     random_img['camera_center'], random_img['camera_rotation'], random_img['styled_img_tensor'], random_img['pano_mask_tensor']
 
+                if train_res != res:
+                    equ_styled = torch.nn.functional.interpolate(equ_styled, size=(train_res, train_res), mode='bilinear', align_corners=False)
+                    equ_mask = torch.nn.functional.interpolate(equ_mask, size=(train_res, train_res), mode='nearest')
+
                 loss = 0
                 color_loss = 0
                 ssim_loss = 0
                 tv_loss = 0
                 propagate_loss = 0
                 project_loss = 0
-                for idx, params in enumerate(pers_params):
-                    fov, theta, phi = params
+                sampled_indices = random.sample(range(len(pers_params)), min(num_sample_views, len(pers_params)))
+                for idx in sampled_indices:
+                    fov, theta, phi = pers_params[idx]
                     R = camera_rotation @ vtf.SO3.from_rpy_radians(math.radians(phi), math.radians(theta), math.radians(0)).as_matrix()
                     # Rq = tf.SO3.from_rpy_radians(math.radians(phi), math.radians(theta), math.radians(-90)) # For drjohnson
                     T = [0,0,0]
                     trans = camera_center
 
                     cam = Simple_Camera(0, R, T, math.radians(90), math.radians(90),
-                                        res, res, "", 0, trans=trans)
+                                        train_res, train_res, "", 0, trans=trans)
 
                     render_params = {
                         'active_sh_degree': self.active_sh_degree_slider.value if hasattr(self, 'active_sh_degree_slider') else 0, 
@@ -1427,9 +1484,22 @@ class Viewer:
 
                     color_loss += l1_loss(equ_mask[idx].to(self.device) * rendered.permute(2,0,1)[None], equ_mask[idx].to(self.device) * equ_styled[idx][None].to(self.device))
                     ssim_loss += 1.0 - ssim(equ_mask[idx].to(self.device) * rendered.permute(2,0,1)[None], equ_mask[idx].to(self.device) * equ_styled[idx][None].to(self.device))
+
+                    # # Save rendered and styled for visualization
+                    # if step % 100 == 0 and idx == sampled_indices[0]:
+                    #     save_dir = "./tmp/pano_debug"
+                    #     os.makedirs(save_dir, exist_ok=True)
+                    #     rendered_img = (rendered.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                    #     styled_img = (equ_styled[idx].permute(1,2,0).detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                    #     Image.fromarray(rendered_img).save(os.path.join(save_dir, f"step{step}_rendered.png"))
+                    #     Image.fromarray(styled_img).save(os.path.join(save_dir, f"step{step}_styled.png"))
+                    #     print(f"[DEBUG] Saved rendered ({rendered_img.shape}, range [{rendered_img.min()},{rendered_img.max()}]) "
+                    #           f"and styled ({styled_img.shape}, range [{styled_img.min()},{styled_img.max()}]) to {save_dir}")
+
+
                     # color_loss += torch.nn.functional.l1_loss(rendered.permute(2,0,1)[None], equ_styled[idx][None])
                     tv_loss += calculate_total_variation_loss_spherical(rendered.permute(2,0,1)[None])
-                    
+
                     torch.cuda.empty_cache()
                     # perceptual_loss = perceptual(rendered.permute(2,0,1)[None], raw_image.permute(2,0,1)[None])
                     # loss += color_loss #+ perceptual_loss#+ sobel_loss #+ perceptual_loss
@@ -1447,22 +1517,30 @@ class Viewer:
                 propagate_loss = l1_loss(self.gaussian_model._features_dc[~all_point_mask], mean_feat_dc) + \
                                 l1_loss(self.gaussian_model._features_rest[~all_point_mask], mean_feat_rest)
 
-                loss = 0.8*color_loss/6 + 0.2*ssim_loss/6 + 1*propagate_loss + 1*project_loss + 1e-3*tv_loss/6
+                color_term     = 0.8 * color_loss / num_sample_views
+                ssim_term      = 0.2 * ssim_loss / num_sample_views
+                tv_term        = 1e-3 * tv_loss / num_sample_views
+                propagate_term = 1.0 * propagate_loss
+                project_term   = 1.0 * project_loss
+
+                loss = color_term + ssim_term + propagate_term + project_term + tv_term
                 # loss = 1*color_loss + 1*propagate_loss + 10*project_loss
 
                 if step%20==0:
                     print("total_loss:", loss.data,
-                          "\t color_loss:", color_loss.data,
-                          "\t ssim_loss:", ssim_loss.data,
-                          "\t tv_loss:", tv_loss.data,
-                          "\t propagate_loss:", propagate_loss.data,
-                          "\t project_loss:", project_loss.data,
+                          "\t color_loss:", color_term.data,
+                          "\t ssim_loss:", ssim_term.data,
+                          "\t tv_loss:", tv_term.data,
+                          "\t propagate_loss:", propagate_term.data,
+                          "\t project_loss:", project_term.data,
                         #   "\t sobel_loss:", sobel_loss.data,
                         #   "\t perceptual_loss:", perceptual_loss.data
                           )
                     self.update_client()
+                
                 torch.cuda.empty_cache()
-                loss.backward(retain_graph=True)
+                # loss.backward(retain_graph=True)
+                loss.backward()
                 self.gaussian_model.optimizer.step()
                 self.gaussian_model.optimizer.zero_grad(set_to_none=True)
 
@@ -1549,7 +1627,8 @@ class Viewer:
         camera_center = np.array([0,0,0])
         steps = 0
         feat_dc_visible, feat_rest_visible = None, None
-        for i in range(len(cam_id)):
+        total_cams = len(cam_id)
+        for i in range(total_cams):
             idx = cam_id[i]
             camera_center = np.load(os.path.join(save_dir, f'cam_{idx}', 'camera_center.npy'))
             camera_rotation = np.load(os.path.join(save_dir, f'cam_{idx}', 'camera_rotation.npy'))
@@ -1581,7 +1660,6 @@ class Viewer:
                                                 style_img_path=self.style_img,
                                                 input_img_path=os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_adain.png'),
                                                 ref_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
-                                                depth_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
                                                 strength=1.0,
                                                 )
                     styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
@@ -1591,7 +1669,6 @@ class Viewer:
                     #                             style_img_path=self.style_img,
                     #                             input_img_path=os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_img.png'),
                     #                             ref_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
-                    #                             depth_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
                     #                             strength=0.8,
                     #                             )
                     # styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
@@ -1620,7 +1697,6 @@ class Viewer:
                                                 input_img_path=os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_img.png'),
                                                 mask_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_mask.png'),
                                                 ref_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
-                                                depth_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
                                                 strength=0.3,
                                                 )
                     styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
@@ -1723,7 +1799,10 @@ class Viewer:
             if not os.path.exists(os.path.join(save_dir, f'cam_{idx}', 'styled', 'scene_styled.ply')):
                 print(f"Training scene in cam_{idx}...")
                 self.gaussian_model.training_setup(opt)
-                train_pano(styled_imgs, feat_dc_visible, feat_rest_visible, 200+25*i, random_flag=True)
+                if i < total_cams - 1:
+                    train_pano(styled_imgs, feat_dc_visible, feat_rest_visible, 200+25*i, random_flag=True, train_res=512)
+                else:
+                    train_pano(styled_imgs, feat_dc_visible, feat_rest_visible, 200+25*i, random_flag=True, train_res=512)
                 self.gaussian_model.save_ply(os.path.join(save_dir, f'cam_{idx}', 'styled', 'scene_styled.ply'))
             else:
                 print(f"Loading {os.path.join(save_dir, f'cam_{idx}', 'styled', 'scene_styled.ply')}")
@@ -1843,7 +1922,7 @@ class Viewer:
                     min=0,
                     max=1,
                     step=0.1,
-                    initial_value=0.5,
+                    initial_value=0.2,
                 )
 
                 self.camera_gap_slider = server.add_gui_slider(

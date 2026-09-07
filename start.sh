@@ -1,36 +1,57 @@
-# CUDA_VISIBLE_DEVICES=0 \
-# python -u viewer.py \
-# data_2dgs/output/drjohnson/point_cloud/iteration_30000/point_cloud.ply \
-# -s data_3dgs/db/drjohnson \
-# --cameras_json data_2dgs/output/drjohnson/cameras.json \
-# --style_img style_data/indoor/room5.jpg \
-# --prep_dir preprocess/drjohnson_focus_cnn_room5 \
-# --port 8087
+#!/bin/bash
+set -e
 
-# CUDA_VISIBLE_DEVICES=1 \
-# python -u viewer.py \
-# data_2dgs/output/drjohnson/point_cloud/iteration_30000/point_cloud.ply \
-# -s data_3dgs/db/drjohnson \
-# --cameras_json data_2dgs/output/drjohnson/cameras.json \
-# --style_img style_data/indoor/office_room.jpg \
-# --prep_dir preprocess/drjohnson_focus_cnn_office_room \
-# --port 8088
+# ===============================Configuration=============================== #
+SOURCE=data_2dgs/output/playroom
+MODEL_DIR=data_2dgs/output/my_scene
+STYLE_IMG=style_data/indoor/room3.jpg
+PREP_DIR=preprocess/my_scene
+RENDER_DIR=renders/my_scene
+GPU=0
+PROMPT=""
+ITERS=30000
+# =========================================================================== #
 
+PLY="$MODEL_DIR/point_cloud/iteration_$ITERS/point_cloud.ply"
+CAMERAS_JSON="$MODEL_DIR/cameras.json"
 
-CUDA_VISIBLE_DEVICES=6 \
-python -u viewer_fast_optimize.py \
-/nas1/hyh22/backup/PanoGS/data_2dgs/output/dl3dv_8cb2e/point_cloud/iteration_30000/point_cloud.ply \
--s /nas1/hyh22/backup/PanoGS/data_3dgs/DL3DV-10K-Benchmark/8cb2e97d26a639f05a571476240a8fa86988e6853f0f13cc05830d1578002aad/gaussian_splat_lowres \
---cameras_json /nas1/hyh22/backup/PanoGS/data_2dgs/output/dl3dv_8cb2e/cameras.json \
---style_img /nas1/hyh22/backup/PanoGS/style_data/cyber.jpg \
---prep_dir preprocess/dl3dv_8cb2e_cyber_center \
---port 8060
+echo "=========================================="
+echo "[1/3] Reconstruct the scene (2DGS)"
+echo "=========================================="
+if [ -f "$PLY" ]; then
+    echo "[skip] found $PLY"
+else
+    CUDA_VISIBLE_DEVICES=$GPU \
+    python 2d_gaussian_splatting/train.py \
+        -s "$SOURCE" \
+        -m "$MODEL_DIR" \
+        --iterations "$ITERS"
+fi
 
-CUDA_VISIBLE_DEVICES=5 \
-python -u viewer_big_room.py \
-/nas1/hyh22/backup/PanoGS/data_big_room_816e9_2dgs_optimized/output/point_cloud/iteration_30000/point_cloud.ply \
--s /nas1/hyh22/backup/PanoGS/data_big_room_816e9_2dgs_optimized \
---cameras_json /nas1/hyh22/backup/PanoGS/data_big_room_816e9_2dgs_optimized/output/cameras.json \
---style_img /nas1/hyh22/backup/PanoGS/style_data/indoor/room3.jpg \
---prep_dir preprocess/manual_816e9_big_room_minorsplit_optimized \
---port 8022
+echo "=========================================="
+echo "[2/3] Stylize (headless)"
+echo "=========================================="
+CUDA_VISIBLE_DEVICES=$GPU \
+python run_stylization.py \
+    "$MODEL_DIR" \
+    -s "$SOURCE" \
+    --cameras_json "$CAMERAS_JSON" \
+    --style_img "$STYLE_IMG" \
+    --prep_dir "$PREP_DIR" \
+    --prompt "$PROMPT" \
+    --iterations "$ITERS"
+
+echo "=========================================="
+echo "[3/3] Render training views"
+echo "=========================================="
+CUDA_VISIBLE_DEVICES=$GPU \
+python render_training_views.py \
+    --prep_dir "$PREP_DIR" \
+    -s "$SOURCE" \
+    --output_dir "$RENDER_DIR"
+
+echo "=========================================="
+echo "Done."
+echo "  stylized model : $PREP_DIR/cam_*/styled/scene_styled.ply"
+echo "  rendered views : $RENDER_DIR"
+echo "=========================================="

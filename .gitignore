@@ -4,6 +4,7 @@ preprocess/
 output_*/
 colmap_viewer/
 data_*/
+.*/
 .vscode/
 __pycache__/
 dist

@@ -1,0 +1,45 @@
+# Template config for run_stylization.py
+# Pass with: python run_stylization.py ... --config configs/stylization_default.yaml
+#
+# All keys mirror DEFAULT_CONFIG in run_stylization.py and override only
+# the fields you list (OmegaConf merge). Defaults shown match the GUI
+# defaults from viewer.py.
+
+render:
+  scale: 1.0                 # gaussian scale modifier (viewer "Scaler" slider)
+  depth_ratio: 0.0           # 0=mean, 1=median (viewer "Depth Ratio" slider)
+  sparsity: 1                # render every N-th gaussian
+  enable_ptc: false          # render as point cloud
+  surfel_mode: ptc           # one of: ptc, disk
+  point_size: 0.01           # used only when enable_ptc=true
+  active_sh_degree: 0        # SH degree used while rendering panoramas
+
+preprocess:
+  camera_gap: 3.0            # multiplier on mean nearest-neighbor distance
+  min_camera_object_dist: 0.3  # cull cameras whose center is too close to a gaussian
+  enable_camera_center: true   # prepend the synthetic centroid camera (id = -1)
+  camera_focus: true           # use each colmap camera's rotation
+  sort_camera_center: true     # sort candidate ids by distance to scene center
+  start_from_center: false     # start the greedy gap walk from the centroid
+  mask_threshold: 0.9          # threshold on rendered visibility mask (0..1)
+  pano_res: 1024               # panorama face resolution
+  # Cap on the number of candidate cameras. If the initial selection
+  # exceeds max_candidates, camera_gap is increased by gap_step and the
+  # selection is retried. Set max_candidates: 0 to disable the cap.
+  max_candidates: 10
+  max_candidates_gap_step: 1.0
+  max_candidates_max_iters: 50
+
+stylization:
+  active_sh_degree: 3          # set on gaussian_model before color_update
+  train_steps: 100             # base step count (viewer "Total Step" slider)
+  color_lr_scaler: 3.0         # passed to OptimizationParams (viewer "Color LR")
+  knn_number: 3                # K for hidden-color propagation / loss
+  train_res: 256               # per-face resolution used during train_pano
+  num_sample_views: 6          # views sampled per training iteration (max 6)
+  step_per_cam: 25             # extra steps added per processed camera
+  step_base: 200               # baseline training steps
+  color_upscale: 4             # upscale factor for the styled panorama lookup
+  missing_rate_threshold: 0.7  # if missing pixels > this, regenerate from scratch
+  first_cam_strength: 1.0      # diffusers strength for the first/restart camera
+  subsequent_cam_strength: 0.3 # diffusers strength for inpaint-refine cameras

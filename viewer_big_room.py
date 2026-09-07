@@ -2715,7 +2715,6 @@ class Viewer:
                                                 style_img_path=self.style_img,
                                                 input_img_path=os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_adain.png'),
                                                 ref_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
-                                                depth_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
                                                 strength=1.0,
                                                 )
                     styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
@@ -2725,7 +2724,6 @@ class Viewer:
                     #                             style_img_path=self.style_img,
                     #                             input_img_path=os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_img.png'),
                     #                             ref_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
-                    #                             depth_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
                     #                             strength=0.8,
                     #                             )
                     # styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
@@ -2754,7 +2752,6 @@ class Viewer:
                                                 input_img_path=os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_img.png'),
                                                 mask_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_mask.png'),
                                                 ref_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
-                                                depth_img_path=os.path.join(save_dir, f'cam_{idx}', 'pano_img.png'),
                                                 strength=0.3,
                                                 )
                     styled_img.save(os.path.join(save_dir, f'cam_{idx}', 'styled', 'pano_styled_refined.png'))
