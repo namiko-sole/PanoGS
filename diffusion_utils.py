@@ -423,26 +423,8 @@ class StableDiffusionXLControlNetLoopConsistPipeline(StableDiffusionXLControlNet
         is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                # if i==len(timesteps)-1:
-                #     # self.image_processor.postprocess(self.vae.decode(latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)/self.vae.config.scaling_factor, return_dict=False)[0], output_type=output_type)[0].save("temp3.png")
-                #     j=4
-                # # # rotate the latents
                 from PIL import Image
                 import numpy as np
-                # rotated_latents = latents.clone()
-                # b,c,h,w = rotated_latents.shape
-                # rotated_latents[:,:,:,:w*7//8] = latents[:,:,:,w//8:]
-                # rotated_latents[:,:,:,w*7//8:] = latents[:,:,:,:w//8]
-                # latents = rotated_latents
-
-                # for i in range(len(image)):
-                #     cond_img = image[i]
-                #     rotated_image = cond_img.clone()
-                #     b,c,h,w = cond_img.shape
-                #     rotated_image[:,:,:,:w*7//8] = cond_img[:,:,:,w//8:]
-                #     rotated_image[:,:,:,w*7//8:] = cond_img[:,:,:,:w//8]
-                #     image[i] = rotated_image
-                #     Image.fromarray((rotated_image[0]*255).permute(1,2,0).detach().cpu().numpy().astype(np.uint8)).save("temp2.png")
 
                 if i!=0 and i<=len(timesteps)-2:
                     rotated_latents = torch.zeros_like(latents)

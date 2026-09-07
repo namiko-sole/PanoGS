@@ -162,7 +162,6 @@ python render_training_views.py \
     -s <path/to/colmap/source> \
     --output_dir renders/myrun
 
-
 # or stylized PLY given directly
 python render_training_views.py \
     --model_path preprocess/myrun/cam_15/styled/scene_styled.ply \

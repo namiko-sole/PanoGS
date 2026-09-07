@@ -1,6 +1,0 @@
-# One dataset root per line.
-# Lines starting with # are comments and will be ignored.
-# Each dataset path should contain sparse/0 and images.
-
-/nas1/hyh22/backup/PanoGS/data_big_room_d918a_2dgs
-/nas1/hyh22/backup/PanoGS/data_big_room2_sparse2

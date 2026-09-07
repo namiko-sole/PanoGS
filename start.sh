@@ -2,12 +2,14 @@
 set -e
 
 # ===============================Configuration=============================== #
-SOURCE=data_2dgs/output/playroom
-MODEL_DIR=data_2dgs/output/my_scene
+SOURCE=data_3dgs/db/playroom
 STYLE_IMG=style_data/indoor/room3.jpg
+
+MODEL_DIR=data_2dgs/output/my_scene
 PREP_DIR=preprocess/my_scene
 RENDER_DIR=renders/my_scene
-GPU=0
+
+GPU=4
 PROMPT=""
 ITERS=30000
 # =========================================================================== #

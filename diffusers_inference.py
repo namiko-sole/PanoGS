@@ -76,7 +76,6 @@ def init_inpaint_model():
     # target_blocks=["up_blocks.0.attentions.1"] for style blocks only
     # target_blocks = ["up_blocks.0.attentions.1", "down_blocks.2.attentions.1"] # for style+layout blocks
     # inpaint_ip_model = IPAdapterXL(inpaint_pipe, inpaint_encoder_path, inpaint_ip_ckpt, device, target_blocks=["block"])
-    # inpaint_ip_model = IPAdapter(inpaint_pipe, image_encoder_path, ip_ckpt, device, target_blocks=["block"])
 
     global refine_pipe
     global refine_ip_model

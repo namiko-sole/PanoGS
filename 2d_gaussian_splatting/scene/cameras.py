@@ -12,8 +12,7 @@
 import torch
 from torch import nn
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix
-from internal.utils.graphics_utils import fov2focal
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix, fov2focal
 
 from typing import Optional, Union
 from dataclasses import dataclass, field
