@@ -27,8 +27,9 @@ class Perspective:
         #
         # THETA is left/right angle, PHI is up/down angle, both in degree
         #
-        merge_image = np.zeros((height,width,3))
-        merge_mask = np.zeros((height,width,3))
+        channels = self.img_array[0].shape[2]
+        merge_image = np.zeros((height,width,channels))
+        merge_mask = np.zeros((height,width,channels))
 
         xyz = get_xyz(width, height)
 
@@ -37,7 +38,7 @@ class Perspective:
             img , mask = per.GetEquirec(xyz,height,width)   # Specify parameters(FOV, theta, phi, height, width)
             mask = mask.astype(np.float32)
             img = img.astype(np.float32)
-            weight_mask = np.zeros((img_dir.shape[0],img_dir.shape[1], 3))
+            weight_mask = np.zeros((img_dir.shape[0],img_dir.shape[1], channels))
             w = img_dir.shape[1]
             weight_mask[:,0:w//2,:] = np.linspace(0,1,w//2)[...,None]
             weight_mask[:,w//2:,:] = np.linspace(1,0,w//2)[...,None]

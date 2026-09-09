@@ -18,12 +18,12 @@ Usage:
         --prompt "a cartoon-style room"
 
 example:
-    CUDA_VISIBLE_DEVICES=5 python run_stylization.py \
-        /data1/hyh/github/PanoGS/data_2dgs/output/dl3dv_389a4/point_cloud/iteration_30000/point_cloud.ply \
-        -s /data1/hyh/github/PanoGS/data_3dgs/DL3DV-10K-Benchmark/389a460ca1995e0658e85fe8e6b520b4e88b370cd6710dfe728b1564bba31aee/gaussian_splat \
-        --cameras_json /data1/hyh/github/PanoGS/data_2dgs/output/dl3dv_389a4/cameras.json \
-        --style_img /data1/hyh/github/PanoGS/style_data/pink.jpg \
-        --prep_dir preprocess/dl3dv_389a4_fast_full_512_script \
+    CUDA_VISIBLE_DEVICES=0 python run_stylization.py \
+        /nas1/nas1/data/hyh22/backup/PanoGS/data_2dgs/output/playroom/point_cloud/iteration_30000/point_cloud.ply \
+        -s /nas1/nas1/data/hyh22/backup/PanoGS/data_3dgs/db/playroom \
+        --cameras_json /nas1/nas1/data/hyh22/backup/PanoGS/data_2dgs/output/playroom/cameras.json \
+        --style_img /nas1/nas1/data/hyh22/backup/PanoGS/style_data/indoor/room3.jpg \
+        --prep_dir preprocess/my_scene_test \
         --prompt ""
 """
 

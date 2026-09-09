@@ -17,8 +17,8 @@ download() {  # download <repo_id> <local_name> [extra args...]
     fi
 }
 
-download stabilityai/stable-diffusion-xl-base-1.0 stable-diffusion-xl-base-1.0
-download h94/IP-Adapter IP-Adapter --include "sdxl_models/*"
-download diffusers/controlnet-canny-sdxl-1.0 controlnet-canny-sdxl-1.0
+download stabilityai/stable-diffusion-xl-base-1.0 stabilityai/stable-diffusion-xl-base-1.0
+download h94/IP-Adapter h94/IP-Adapter --include "sdxl_models/*"
+download diffusers/controlnet-canny-sdxl-1.0 diffusers/controlnet-canny-sdxl-1.0
 
 echo "Done. Checkpoints are in $CHECKPOINTS_DIR"

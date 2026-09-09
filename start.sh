@@ -9,7 +9,7 @@ MODEL_DIR=data_2dgs/output/my_scene
 PREP_DIR=preprocess/my_scene
 RENDER_DIR=renders/my_scene
 
-GPU=4
+GPU=0
 PROMPT=""
 ITERS=30000
 # =========================================================================== #

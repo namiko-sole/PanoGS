@@ -13,6 +13,7 @@ eggs
 parts
 sdist
 temp*
+checkpoints
 
 # File
 *.pyc

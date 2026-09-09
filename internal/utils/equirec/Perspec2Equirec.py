@@ -61,7 +61,7 @@ class Perspective:
         persp = cv2.remap(self._img, lon_map.astype(np.float32), lat_map.astype(np.float32), cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
         
         mask = mask * inverse_mask
-        mask = np.repeat(mask[:, :, np.newaxis], 3, axis=2)
+        mask = np.repeat(mask[:, :, np.newaxis], self._img.shape[2], axis=2)
         persp = persp * mask
         
         

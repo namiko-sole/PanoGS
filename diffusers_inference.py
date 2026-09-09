@@ -32,12 +32,13 @@ refine_pipe = None
 refine_ip_model = None
 
 # All diffusion checkpoints are loaded from the local ``checkpoints/`` folder
-CHECKPOINTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+# CHECKPOINTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+CHECKPOINTS_DIR = "/nas1/nas1/data/hyh22/HuggingFaceModels"
 
-base_model_path = os.path.join(CHECKPOINTS_DIR, "stable-diffusion-xl-base-1.0")
-image_encoder_path = os.path.join(CHECKPOINTS_DIR, "IP-Adapter", "sdxl_models", "image_encoder")
-ip_ckpt = os.path.join(CHECKPOINTS_DIR, "IP-Adapter", "sdxl_models", "ip-adapter_sdxl.bin")
-controlnet_canny_path = os.path.join(CHECKPOINTS_DIR, "controlnet-canny-sdxl-1.0")
+base_model_path = os.path.join(CHECKPOINTS_DIR, "stabilityai", "stable-diffusion-xl-base-1.0")
+image_encoder_path = os.path.join(CHECKPOINTS_DIR, "h94", "IP-Adapter", "sdxl_models", "image_encoder")
+ip_ckpt = os.path.join(CHECKPOINTS_DIR, "h94", "IP-Adapter", "sdxl_models", "ip-adapter_sdxl.bin")
+controlnet_canny_path = os.path.join(CHECKPOINTS_DIR, "diffusers", "controlnet-canny-sdxl-1.0")
 
 
 def init_inpaint_model():
