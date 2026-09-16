@@ -894,13 +894,13 @@ class Viewer:
                 loss = color_term + ssim_term + propagate_term + project_term + tv_term
 
                 if step%20==0:
-                    print("total_loss:", loss.data,
-                          "\t color_loss:", color_term.data,
-                          "\t ssim_loss:", ssim_term.data,
-                          "\t tv_loss:", tv_term.data,
-                          "\t propagate_loss:", propagate_term.data,
-                          "\t project_loss:", project_term.data,
-                          )
+                    # print("total_loss:", loss.data,
+                    #       "\t color_loss:", color_term.data,
+                    #       "\t ssim_loss:", ssim_term.data,
+                    #       "\t tv_loss:", tv_term.data,
+                    #       "\t propagate_loss:", propagate_term.data,
+                    #       "\t project_loss:", project_term.data,
+                    #       )
                     self.update_client()
 
                 torch.cuda.empty_cache()
