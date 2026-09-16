@@ -1,10 +1,14 @@
-# PanoGS: Panorama-driven Stylization for Gaussian Splatting
+# PanoGS: Panorama-based 3D Scene Stylization with Style and Geometry Consistency
+
+<a href="https://namiko-sole.github.io/panogs.github.io/" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
+<a href="https://doi.org/10.1109/TIP.2026.3731941"><img src="https://img.shields.io/badge/Paper-STAC-red" alt="Paper PDF"></a>
 
 Official implementation of "Panorama-based 3D Scene Stylization with Style and Geometry Consistency" — accepted to **IEEE Transactions on Image Processing (TIP) 2026**.
 
 <p align="center">
   <img src="img/teaser.jpg" alt="PanoGS teaser" width="100%">
 </p>
+
 
 ## Table of Contents
 
@@ -29,7 +33,7 @@ The code is tested with Python 3.8, PyTorch 2.4.1 and CUDA 12.1.
 
 ```bash
 # clone the repository
-git clone https://github.com/<your-org>/PanoGS.git
+git clone https://github.com/namiko-sole/PanoGS.git
 cd PanoGS
 
 # create the environment
@@ -45,7 +49,7 @@ cd ..
 
 ### Diffusion Checkpoints
 
-PanoGS uses SDXL with ControlNet (canny) and IP-Adapter for stylization. Download the following models from HuggingFace and place them under the `checkpoints/` folder (the paths are resolved in [`diffusers_inference.py`](diffusers_inference.py) relative to the repository root):
+Download the following models from HuggingFace and place them under the `checkpoints/` folder (the paths are resolved in [`diffusers_inference.py`](diffusers_inference.py) relative to the repository root):
 
 ```bash
 bash download_checkpoints.sh
@@ -192,8 +196,6 @@ All knobs of the headless pipeline live in [`configs/stylization_default.yaml`](
 | `stylization` | `train_res` | per-face resolution during the panoramic training loop |
 | `stylization` | `train_steps` / `step_per_cam` | base step count / extra steps per camera |
 | `stylization` | `knn_number` | K for hidden-point color propagation |
-
-Pass a modified copy with `--config configs/my_config.yaml`; only the listed keys override the defaults.
 
 ## Acknowledgements
 
