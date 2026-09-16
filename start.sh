@@ -2,16 +2,20 @@
 set -e
 
 # ===============================Configuration=============================== #
+# input directories
 SOURCE=data_3dgs/db/playroom
 STYLE_IMG=style_data/indoor/room3.jpg
 
+# output directories
 MODEL_DIR=data_2dgs/output/my_scene
 PREP_DIR=preprocess/my_scene
 RENDER_DIR=renders/my_scene
 
+# other parameters
 GPU=0
 PROMPT=""
 ITERS=30000
+CONFIG=configs/stylization_default.yaml
 # =========================================================================== #
 
 PLY="$MODEL_DIR/point_cloud/iteration_$ITERS/point_cloud.ply"
@@ -41,6 +45,7 @@ python run_stylization.py \
     --style_img "$STYLE_IMG" \
     --prep_dir "$PREP_DIR" \
     --prompt "$PROMPT" \
+    --config "$CONFIG" \
     --iterations "$ITERS"
 
 echo "=========================================="

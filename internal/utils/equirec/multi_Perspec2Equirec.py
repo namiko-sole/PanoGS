@@ -36,30 +36,22 @@ class Perspective:
         for img_dir,[F,T,P] in zip (self.img_array,self.F_T_P_array):
             per = P2E.Perspective(img_dir,F,T,P)        # Load equirectangular image
             img , mask = per.GetEquirec(xyz,height,width)   # Specify parameters(FOV, theta, phi, height, width)
-            mask = mask.astype(np.float32)
-            img = img.astype(np.float32)
-            weight_mask = np.zeros((img_dir.shape[0],img_dir.shape[1], channels))
-            w = img_dir.shape[1]
-            weight_mask[:,0:w//2,:] = np.linspace(0,1,w//2)[...,None]
-            weight_mask[:,w//2:,:] = np.linspace(1,0,w//2)[...,None]
-            weight_mask = P2E.Perspective(weight_mask,F,T,P)
-            weight_mask, _ = weight_mask.GetEquirec(xyz,height,width)
-            blur = cv2.blur(mask,(5,5))
-            blur = blur * mask
-            mask = (blur == 1) * blur + (blur != 1) * blur * 0.05
-            merge_image += img * weight_mask
-            merge_mask += weight_mask
+            # NOTE: the old linear-ramp "feather" weights were removed on purpose.
+            # With 90-degree faces every equirect pixel is covered by exactly one
+            # face, so the ramps cancel out everywhere except at the face boundary
+            # lines where they are ~0. Under OpenCV >= 5 cv2.remap evaluates the
+            # ramp to exactly 0 there, which triggered the mean-color fill below
+            # and produced visible constant-value seam lines in the panorama.
+            # `img` is already multiplied by the coverage mask inside
+            # Perspec2Equirec.GetEquirec, so accumulate it directly; this is
+            # cv2-version independent (verified identical on OpenCV 4.13 and 5.0).
+            merge_image += img.astype(np.float32)
+            merge_mask += mask.astype(np.float32)
         merge_image[merge_mask==0] = merge_image.mean()
-
-        # 取最近邻均值填充
-        # kernel = np.ones((3,3), np.float32) / 8
-        # kernel[1,1] = 0
-        # conv_image = cv2.filter2D(merge_image, -1, kernel)
-        # merge_image[merge_mask==0] = conv_image[merge_mask==0]
 
         merge_mask = np.where(merge_mask==0,1,merge_mask)
         merge_image = (np.divide(merge_image,merge_mask))
-        
+
         return merge_image
         
         

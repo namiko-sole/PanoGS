@@ -76,7 +76,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.sh_degree,
             raster_settings.campos,
             raster_settings.prefiltered,
-            raster_settings.debug
+            raster_settings.debug,
+            raster_settings.sphere_mode
         )
 
         # Invoke C++/CUDA rasterizer
@@ -157,7 +158,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
-    image_width: int 
+    image_width: int
     tanfovx : float
     tanfovy : float
     bg : torch.Tensor
@@ -168,6 +169,11 @@ class GaussianRasterizationSettings(NamedTuple):
     campos : torch.Tensor
     prefiltered : bool
     debug : bool
+    # Sphere mode: sort splats by radial camera distance instead of per-view z
+    # depth. Use it for panorama rendering via cubemap faces so overlapping
+    # Gaussians composite in the same order in every face and the stitched
+    # panorama has no seams at face boundaries. Culling behavior is unchanged.
+    sphere_mode : bool = False
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):

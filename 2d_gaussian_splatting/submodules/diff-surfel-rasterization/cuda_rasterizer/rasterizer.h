@@ -51,7 +51,8 @@ namespace CudaRasterizer
 			float* out_color,
 			float* out_others,
 			int* radii = nullptr,
-			bool debug = false);
+			bool debug = false,
+			bool sphere_mode = false);
 
 		static void backward(
 			const int P, int D, int M, int R,

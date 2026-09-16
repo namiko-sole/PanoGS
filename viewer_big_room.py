@@ -1477,13 +1477,14 @@ class Viewer:
             'scaling_modifier': self.scale_slider.value, 
             'depth_ratio': self.depth_ratio_slider.value,
             'bg_color': self.viewer_renderer.background_color,
-            'sparsity': self.sparsity_slider.value, 
+            'sparsity': self.sparsity_slider.value,
             'valid_range': None,
             'show_ptc': self.enable_ptc.value and (self.surfel_mode.value == 'ptc'),
             'show_disk': self.enable_ptc.value and (self.surfel_mode.value == 'disk'),
             'point_size': self.point_size.value,
             # 'override_color': SH2RGB(self.gaussian_model._features_dc.squeeze()),
             'override_color': override_color,
+            'sphere_mode': True,
         }
 
         with torch.no_grad():
@@ -1538,7 +1539,7 @@ class Viewer:
             if save_dir:
                 print(f"saving into {save_dir}")
                 os.makedirs(save_dir, exist_ok=True)
-                Image.fromarray(pano_image.astype(np.uint8)).save(os.path.join(save_dir, 'pano_img.png'))
+                Image.fromarray(np.clip(pano_image, 0, 255).astype(np.uint8)).save(os.path.join(save_dir, 'pano_img.png'))
                 # Image.fromarray(((pano_depth-pano_depth.min())/(pano_depth.max()-pano_depth.min()+1e-9)*255).astype(np.uint8)).save(os.path.join(save_dir, 'pano_depth.png'))
                 Image.fromarray((((pano_depth-pano_depth.min())/(pano_depth.max()-pano_depth.min())*0.6+0.2)*255).astype(np.uint8)).save(os.path.join(save_dir, 'pano_depth.png')) # depth 50-200            
                 # Image.fromarray(((pano_depth_distorted-pano_depth_distorted.min())/(pano_depth_distorted.max()-pano_depth_distorted.min()+1e-9)*255).astype(np.uint8)).save(os.path.join(save_dir, 'pano_depth_distorted.png'))

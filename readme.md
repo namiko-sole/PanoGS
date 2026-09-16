@@ -18,7 +18,6 @@ Official implementation of "Panorama-based 3D Scene Stylization with Style and G
     - [2. Stylize](#2-stylize)
     - [3. Render training views](#3-render-training-views)
 - [Configuration](#configuration)
-- [Repository Structure](#repository-structure)
 - [Acknowledgements](#acknowledgements)
 - [Citation](#citation)
 
@@ -61,7 +60,7 @@ checkpoints/
 │   └── sdxl_models/
 │       ├── image_encoder/
 │       └── ip-adapter_sdxl.bin
-├── controlnet-canny-sdxl-1.0/
+└── controlnet-canny-sdxl-1.0/
 ```
 
 Alternatively, if you already have the models in a local HuggingFace cache, symlinking them one by one works too.
@@ -73,15 +72,20 @@ Alternatively, if you already have the models in a local HuggingFace cache, syml
 The whole pipeline — reconstruction, stylization and training-view rendering — can be run with a single command via [`start.sh`](start.sh). Edit the variables at the top of the script to point at your scene and style image:
 
 ```bash
-# start.sh (edit these)
+# input directories
 SOURCE=data/my_scene/colmap           # COLMAP source directory
-MODEL_DIR=data_2dgs/output/my_scene   # 2DGS reconstruction output
 STYLE_IMG=style_data/indoor/room3.jpg # reference style image
+
+# output directories
+MODEL_DIR=data_2dgs/output/my_scene   # 2DGS reconstruction output
 PREP_DIR=preprocess/my_scene          # stylization output
-RENDER_DIR=renders/my_scene            # rendered training views
+RENDER_DIR=renders/my_scene            # rendered training views output
+
+# other parameters
 GPU=0                                  # CUDA device id
 PROMPT=""                             # optional text prompt
 ITERS=30000                            # 2DGS training iterations
+CONFIG=configs/stylization_default.yaml # stylization config YAML
 ```
 
 then run:
@@ -92,9 +96,14 @@ bash start.sh
 
 Every stage is skipped when its output already exists, so the script can be re-run to resume an interrupted job: if the trained PLY is present, 2DGS training is skipped, and `run_stylization.py` reuses existing panoramas and per-camera stylized models.
 
+If you need to adjust the parameters, see [Configuration](#configuration) and edit the configuration file.
+
 ### Step-by-step
 
 The sections below explain each of the three stages individually, for when you need finer control over a single step.
+
+<details>
+<summary>Click to expand the step-by-step details</summary>
 
 #### 1. Reconstruct the scene
 
@@ -169,20 +178,20 @@ python render_training_views.py \
     --output_dir renders/myrun
 ```
 
+</details>
+
 ## Configuration
 
-All knobs of the headless pipeline mirror the GUI defaults and live in [`configs/stylization_default.yaml`](configs/stylization_default.yaml). Highlights:
+All knobs of the headless pipeline live in [`configs/stylization_default.yaml`](configs/stylization_default.yaml). Highlights:
 
 | Section | Key | Description |
 | --- | --- | --- |
+| `preprocess` | `start_from_center` | start the greedy camera-gap walk from the scene centroid — better for indoor rooms |
 | `preprocess` | `camera_gap` | spacing between candidate cameras (× mean NN distance) |
 | `preprocess` | `max_candidates` | cap on the number of cameras (0 disables) |
-| `preprocess` | `pano_res` | panorama face resolution |
 | `stylization` | `train_res` | per-face resolution during the panoramic training loop |
 | `stylization` | `train_steps` / `step_per_cam` | base step count / extra steps per camera |
 | `stylization` | `knn_number` | K for hidden-point color propagation |
-| `stylization` | `first_cam_strength` | diffusion strength for the first (from-scratch) panorama |
-| `stylization` | `subsequent_cam_strength` | diffusion strength for inpaint-refined panoramas |
 
 Pass a modified copy with `--config configs/my_config.yaml`; only the listed keys override the defaults.
 

@@ -1,12 +1,4 @@
-"""Standalone preprocess + stylization pipeline extracted from viewer.py.
-
-Replicates the behaviour of the viser-driven viewer for headless runs:
-  1. load a 2D/3D Gaussian PLY and the colmap scene,
-  2. pick candidate cameras and pre-render the per-camera panoramas/masks
-     (mirrors `Viewer.run_preprocess` callback),
-  3. for every selected camera, project a stylised panorama onto the
-     gaussians, propagate colours to hidden points and fine-tune the SH
-     features with the panoramic training loop (`color_update`).
+"""Standalone preprocess + stylization pipeline.
 
 Usage:
     python run_stylization.py \
@@ -383,7 +375,7 @@ class StylizationPipeline:
         if save_dir:
             # print(f"saving into {save_dir}")
             os.makedirs(save_dir, exist_ok=True)
-            Image.fromarray(pano_image.astype(np.uint8)).save(
+            Image.fromarray(np.clip(pano_image, 0, 255).astype(np.uint8)).save(
                 os.path.join(save_dir, "pano_img.png")
             )
             np.save(
@@ -425,6 +417,7 @@ class StylizationPipeline:
             "show_disk": self.enable_ptc.value
             and (self.surfel_mode.value == "disk"),
             "point_size": self.point_size.value,
+            "sphere_mode": True,
         }
         if override_color is not None:
             params["override_color"] = override_color

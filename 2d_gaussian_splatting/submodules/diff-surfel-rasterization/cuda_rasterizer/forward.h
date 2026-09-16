@@ -47,7 +47,8 @@ namespace FORWARD
 		float4* normal_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
-		bool prefiltered);
+		bool prefiltered,
+		bool sphere_mode = false);
 
 	// Main rasterization method.
 	void render(

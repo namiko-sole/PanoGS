@@ -172,7 +172,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	const bool sphere_mode)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -185,7 +186,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Perform near culling, quit if outside.
 	float3 p_view;
-	if (!in_sphere(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
+	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
 		return;
 	
 	// Compute transformation matrix
@@ -245,8 +246,16 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		rgb[idx * C + 2] = result.z;
 	}
 
-	depths[idx] = p_view.z;
-	// depths[idx] = 0;
+	// Sort key for the per-tile alpha blending order. In sphere mode (panorama
+	// rendering via cubemap faces) use the radial camera distance instead of the
+	// per-view z depth: the distance is identical in every face that shares the
+	// camera center, so the same pair of overlapping Gaussians composites in the
+	// same order in all faces and the stitched panorama stays seamless across the
+	// face boundaries (the per-face z depth can order them differently).
+	if (sphere_mode)
+		depths[idx] = sqrtf(p_view.x * p_view.x + p_view.y * p_view.y + p_view.z * p_view.z);
+	else
+		depths[idx] = p_view.z;
 	radii[idx] = (int)radius;
 	points_xy_image[idx] = point_image;
 	normal_opacity[idx] = {normal.x, normal.y, normal.z, opacities[idx]};
@@ -503,7 +512,8 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	bool sphere_mode)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -530,6 +540,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		normal_opacity,
 		grid,
 		tiles_touched,
-		prefiltered
+		prefiltered,
+		sphere_mode
 		);
 }

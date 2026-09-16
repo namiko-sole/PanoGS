@@ -451,6 +451,7 @@ class Viewer:
             'show_disk': self.enable_ptc.value and (self.surfel_mode.value == 'disk'),
             'point_size': self.point_size.value,
             'override_color': override_color,
+            'sphere_mode': True,
         }
         timings['prepare_cameras_params'] = time.perf_counter() - stage_start_time
 
@@ -509,7 +510,7 @@ class Viewer:
             if save_dir:
                 print(f"saving into {save_dir}")
                 os.makedirs(save_dir, exist_ok=True)
-                Image.fromarray(pano_image.astype(np.uint8)).save(os.path.join(save_dir, 'pano_img.png'))
+                Image.fromarray(np.clip(pano_image, 0, 255).astype(np.uint8)).save(os.path.join(save_dir, 'pano_img.png'))
                 Image.fromarray((((pano_depth-pano_depth.min())/(pano_depth.max()-pano_depth.min())*0.6+0.2)*255).astype(np.uint8)).save(os.path.join(save_dir, 'pano_depth.png')) # depth 50-200
                 np.save(os.path.join(save_dir, 'pano_depth.npy'), pano_depth)
                 np.save(os.path.join(save_dir, 'camera_center.npy'), Trans.detach().cpu().numpy())
@@ -855,6 +856,7 @@ class Viewer:
                         'show_disk': self.enable_ptc.value and (self.surfel_mode.value == 'disk'),
                         'point_size': self.point_size.value,
                         'override_color': SH2RGB(self.gaussian_model._features_dc.squeeze()),
+                        'sphere_mode': True,
                     }
 
                     results = self.viewer_renderer.render_viewer(

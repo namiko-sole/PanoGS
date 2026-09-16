@@ -208,43 +208,11 @@ __forceinline__ __device__ bool in_frustum(int idx,
 	return true;
 }
 
-__forceinline__ __device__ float3 point_to_equirect(
-	float3 p_orig,
-	const float* viewmatrix)
-{
-	float3 direction_vector = transformPoint4x3(p_orig, viewmatrix);
-	// float3 direction_vector = p_orig - p_cam;
-	float direction_vector_length = sqrtf(direction_vector.x * direction_vector.x + direction_vector.y * direction_vector.y + direction_vector.z * direction_vector.z);
-	float longitude = atan2f(direction_vector.x, direction_vector.z);
-	float latitude = atan2f(direction_vector.y , sqrtf(direction_vector.x * direction_vector.x + direction_vector.z * direction_vector.z));
-	float normalized_latitude = latitude / (M_PI / 2.0f);
-	float normalized_longitude = longitude / M_PI;
-	float3 p_view = {normalized_longitude, normalized_latitude, direction_vector_length};
-	return p_view;
-}
-
-__forceinline__ __device__ bool in_sphere(int idx,
-	const float* orig_points,
-	const float* viewmatrix,
-	const float* projmatrix,
-	bool prefiltered,
-	float3& p_view)
-{
-    float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
-	// float3 p_cam = (float3){cam_pos.x, cam_pos.y, cam_pos.z};
-	p_view = point_to_equirect(p_orig, viewmatrix);
-	// if (p_view.z <= 0.2f || p_view.z >= 100.0f)
-	if (p_view.z <= 0.2f)
-	{
-		if (prefiltered)
-		{
-			printf("Point is filtered although prefiltered is set. This shouldn't happen!");
-			__trap();
-		}
-		return false;
-	}
-	return true;
-}
+// Sphere mode (panorama / cubemap-face rendering) reuses in_frustum's culling and
+// view-space p_view verbatim; its only effect is the blending-order sort key
+// (depths) set in forward.cu: preprocessCUDA, which switches from the per-view
+// z depth to the radial camera distance so the compositing order of overlapping
+// Gaussians is invariant across the cubemap faces sharing one camera center.
 
 // adopt from gsplat: https://github.com/nerfstudio-project/gsplat/blob/main/gsplat/cuda/csrc/forward.cu
 inline __device__ glm::mat3 quat_to_rotmat(const glm::vec4 quat) {

@@ -2,8 +2,6 @@
 # Pass with: python run_stylization.py ... --config configs/stylization_default.yaml
 #
 # All keys mirror DEFAULT_CONFIG in run_stylization.py and override only
-# the fields you list (OmegaConf merge). Defaults shown match the GUI
-# defaults from viewer.py.
 
 render:
   scale: 1.0                 # gaussian scale modifier (viewer "Scaler" slider)

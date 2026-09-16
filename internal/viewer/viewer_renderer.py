@@ -59,20 +59,23 @@ class ViewerRenderer:
             return map
 
     def render_viewer(self,
-                    viewpoint_camera, 
-                    active_sh_degree, 
-                    scaling_modifier, 
+                    viewpoint_camera,
+                    active_sh_degree,
+                    scaling_modifier,
                     depth_ratio,
-                    bg_color : torch.Tensor, 
+                    bg_color : torch.Tensor,
                     sparsity: int = 1,
                     show_ptc: bool = False,
                     show_disk: bool = False,
                     point_size: float = 0.001,
                     valid_range = None,
-                    override_color = None):
+                    override_color = None,
+                    sphere_mode: bool = False):
         """
-        Render the scene. 
+        Render the scene.
         Background tensor (bg_color) must be on GPU!
+        Set sphere_mode=True for cubemap-face (panorama) rendering so overlapping
+        Gaussians composite in the same order in every face (seamless stitching).
         """
         # Set up rasterization configuration
         tanfovx = math.tan(viewpoint_camera.fov_x * 0.5)
@@ -91,6 +94,7 @@ class ViewerRenderer:
             campos=viewpoint_camera.camera_center,
             prefiltered=False,
             debug=False,
+            sphere_mode=sphere_mode,
         )
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
