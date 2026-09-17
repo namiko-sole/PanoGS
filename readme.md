@@ -1,7 +1,7 @@
 # PanoGS: Panorama-based 3D Scene Stylization with Style and Geometry Consistency
 
 <a href="https://namiko-sole.github.io/panogs.github.io/" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
-<a href="https://doi.org/10.1109/TIP.2026.3731941"><img src="https://img.shields.io/badge/Paper-STAC-red" alt="Paper PDF"></a>
+<a href="https://doi.org/10.1109/TIP.2026.3731941"><img src="https://img.shields.io/badge/Paper-PanoGS-red" alt="Paper PDF"></a>
 
 Official implementation of "Panorama-based 3D Scene Stylization with Style and Geometry Consistency" — accepted to **IEEE Transactions on Image Processing (TIP) 2026**.
 
